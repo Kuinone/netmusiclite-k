@@ -580,6 +580,15 @@ object NcmApi {
         SearchResult(songList, artists, albums)
     }
 
+    /** 只搜歌（歌词在线兜底匹配用）—— search() 会连搜艺人/专辑共三次请求，这里只发一次 */
+    suspend fun searchSongs(kw: String, limit: Int = 10): List<Song> = withContext(Dispatchers.IO) {
+        val body = JSONObject()
+            .put("s", kw).put("limit", limit).put("offset", 0)
+            .put("type", 1).put("csrf_token", "").put("hlpretag", "").put("hlposttag", "")
+        val j = we("/cloudsearch/get/web", body)
+        songs(j.optJSONObject("result")?.optJSONArray("songs"))
+    }
+
     // ---------- 歌曲元数据 / 播放 / 歌词 ----------
     /** 分片并行拉取（80 个/片），结果严格保持传入 ids 顺序；单片段失败只丢该片段 */
     suspend fun songDetail(ids: List<Long>): List<Song> = withContext(Dispatchers.IO) {
