@@ -14,7 +14,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.lazy.LazyColumn
+import com.netmusiclite.ui.m3e.AdaptiveLazyColumn as LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -38,11 +38,13 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.navigation.NavHostController
 import com.netmusiclite.data.AlbumItem
 import com.netmusiclite.data.DownloadStore
 import com.netmusiclite.data.ListenSession
 import com.netmusiclite.data.NcmApi
+import com.netmusiclite.data.PageCache
 import com.netmusiclite.data.PlayerEngine
 import com.netmusiclite.data.Song
 import com.netmusiclite.ui.components.AlbumCardRow
@@ -86,14 +88,17 @@ fun ArtistScreen(
 ) {
     var artist by remember { mutableStateOf<NcmApi.ArtistPage?>(null) }
     var albums by remember { mutableStateOf<List<AlbumItem>>(emptyList()) }
-    var tab by remember { mutableStateOf(0) }
+    // ★ 2026-10-07 用户口径「艺人主页专辑界面点击相应专辑之后返回应当返回艺人主页的专辑页面」：
+    //   tab 改 rememberSaveable —— 进专辑详情再返回，导航栈会把本页的可保存状态恢复回来，
+    //   专辑 Tab（以及列表滚动位置）原地还原；普通 remember 返回即重置成歌曲 Tab。
+    var tab by rememberSaveable { mutableStateOf(0) }
     var following by remember { mutableStateOf(false) }
     var toast by remember { mutableStateOf<String?>(null) }
     val selected = remember { mutableStateMapOf<Long, Song>() }
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
 
-    // ★ 2026-10-01 晚（用户要求）：**去掉**歌曲 ⇄ 专辑的切换过渡动画，并**移除**
+    // ★ 2026-10-07 晚（用户要求）：**去掉**歌曲 ⇄ 专辑的切换过渡动画，并**移除**
     //   「歌曲列表左划切到专辑」的手势（AppNav 里挂的 onSwipeLeft 一并拿掉）。
     //   现在点「歌曲 / 专辑」文字就是原地直接换内容：没有位移、没有缩放、没有淡入淡出。
     fun switchTab(target: Int) {
@@ -101,10 +106,14 @@ fun ArtistScreen(
     }
 
     LaunchedEffect(artistId) {
-        artist = NcmApi.artistHot(artistId)
-        albums = NcmApi.artistAlbums(artistId)
-        // 关注红心回读真实状态（此前固定 false，已关注的艺人也显示未关注）
-        following = NcmApi.artistFollowed(artistId)
+        // 走 PageCache：进过一次的艺人页吃会话缓存 —— 从专辑详情返回时不重拉、列表不闪
+        // 「加载中/暂无专辑」（与专辑详情/歌单详情同款缓存策略）。关注态一并缓存，
+        // 页内点关注/取消时由 setArtistFollowing 写穿（见下），返回不会闪旧值。
+        PageCache.artistBundle(artistId)?.let { (p, al, f) ->
+            artist = p
+            albums = al
+            following = f
+        }
     }
 
     val songs = artist?.songs ?: emptyList()
@@ -119,9 +128,23 @@ fun ArtistScreen(
     }
 
     Box(Modifier.fillMaxSize().background(screenBg()).rotaryList(listState)) {
+        // ★ 2026-10-17 用户口径「m3e 主题下艺人主页头图背景没有完全覆盖」：
+        //   根因：m3e 列表（NativeList）默认横向安全内距 9dp/16dp、顶部取 ScreenScaffold 的
+        //   TimeText 内距，头图 item 被一起收窄 ⇒ 左右各露一条页面底色、顶部还有一道空带。
+        //   edgeToEdge = 列表内容通宽（横向 0 / 顶部 0），头图铺满圆屏到 y=0；
+        //   正文（歌曲行 / 专辑卡 / Tab）自己在下面补 16dp 水平内距，避开圆屏弧区。
+        // ★ 2026-10-17 用户口径「艺人主页的歌曲/专辑列表不涉及堆叠禁用」：
+        //   本页**保留 WEAR 形变（堆叠）**；只用 safeKeys 让头图与 Tab 行不参与形变 ——
+        //   它们是不消费 SurfaceTransformation 的复合内容，形变只会压缩它们的占位高度、
+        //   让后面滚上来的歌曲卡盖住「关注 / 乐迷团」按钮（用户报的第二个问题）。
+        //   歌曲卡 / 专辑卡是 Material 组件，形变时内容与占位同步缩放，不会互相遮盖。
+        val edgeToEdge = com.netmusiclite.data.AppearancePrefs.isM3e
+        val contentInset = if (edgeToEdge) 16.dp else 0.dp
         LazyColumn(
             state = listState,
             contentPadding = PaddingValues(bottom = 90.dp),
+            edgeToEdge = edgeToEdge,
+            safeKeys = setOf("header", "tabs", "dl_hint"),
             // 2026-10-01 晚：Tab 切换改为原地直接换内容，列表本体不再需要任何转场图层
         ) {
             item(key = "header") {
@@ -139,19 +162,29 @@ fun ArtistScreen(
                             if (following) {
                                 CircleSvgButtonFilled(NcmIcons.HeartFill, size = 44.dp) {
                                     following = false
+                                    PageCache.setArtistFollowing(artistId, false)
                                     scope.launch {
                                         // 取消关注结果校验：失败回滚红心并提示（旧版乐观置位，
                                         // 服务端静默失败时按钮看起来取消了、实际没取消）
                                         val okUn = runCatching { NcmApi.artistSub(artistId, false) }.getOrDefault(false)
-                                        if (!okUn) { following = true; toast = "取消关注失败，请重试" }
+                                        if (!okUn) {
+                                            following = true
+                                            PageCache.setArtistFollowing(artistId, true)
+                                            toast = "取消关注失败，请重试"
+                                        }
                                     }
                                 }
                             } else {
                                 CircleSvgButton(NcmIcons.Heart, contentDesc = "关注", size = 44.dp) {
                                     following = true
+                                    PageCache.setArtistFollowing(artistId, true)
                                     scope.launch {
                                         val okSub = runCatching { NcmApi.artistSub(artistId, true) }.getOrDefault(false)
-                                        if (!okSub) { following = false; toast = "关注失败，请重试" }
+                                        if (!okSub) {
+                                            following = false
+                                            PageCache.setArtistFollowing(artistId, false)
+                                            toast = "关注失败，请重试"
+                                        }
                                     }
                                 }
                             }
@@ -172,7 +205,7 @@ fun ArtistScreen(
             }
             item(key = "tabs") {
                 Row(
-                    Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 6.dp),
+                    Modifier.fillMaxWidth().padding(horizontal = contentInset).padding(top = 12.dp, bottom = 6.dp),
                     horizontalArrangement = Arrangement.Center,
                 ) {
                     // 2026-10-01 晚：去掉过渡动画 —— 点击即为原地直接切换
@@ -197,7 +230,7 @@ fun ArtistScreen(
                     // 离屏幕横向中线越远的歌曲，缩放越小、越暗（中央一首最大最亮）。
                     // 歌曲行是通宽平铺样式，在行外包一层做图层变换即可；不动 SongRow 本体，
                     // 搜索/历史/歌单等同样用 SongRow 的页面不受影响。
-                    Box(Modifier.sinkFromCenter()) {
+                    Box(Modifier.sinkFromCenter().padding(horizontal = contentInset)) {
                         SongRow(
                             song = song,
                             isCurrent = PlayerEngine.current?.id == song.id,
@@ -224,7 +257,7 @@ fun ArtistScreen(
                     itemsIndexed(albums.sortedByDescending { it.publishTime }, key = { _, a -> a.id }, contentType = { _, _ -> "album" }) { _, album ->
                         // 与「歌曲」Tab 同一套边缘下沉（2026-09-30 用户要求）：专辑卡离屏幕中线越远
                         // 越小越淡，中央一张最大最亮。AlbumCardRow 本体不动，只在外面套一层图层变换。
-                        Box(Modifier.sinkFromCenter()) {
+                        Box(Modifier.sinkFromCenter().padding(horizontal = contentInset)) {
                             AlbumCardRow(album) {
                                 nav.navigateWithMotion(
                                     Routes.albumDetail(album.id),

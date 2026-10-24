@@ -16,9 +16,34 @@
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
+    <!-- 应用内更新（2026-10-02）：GitHub 远程更新通道，下载新包后拉起系统安装器覆盖安装 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <!-- ★ 媒体库扫描（2026-10-03 内置图片管理器 / 导入本地音乐）：
+         两处都按「用哪个功能申请哪个权限」在运行时弹系统对话框，不在启动时索要。
+         API 33+ 走细分媒体权限；API 26~32 统一走 READ_EXTERNAL_STORAGE（仅旧版本声明）。 -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+
+    <!-- 实验性手势操控：前台读 ACC + GYRO，标准传感器、无需运行时权限。
+         声明为可选硬件：缺失时 GestureControl 会自动让开关保持关闭，不阻断安装。 -->
+    <uses-feature android:name="android.hardware.sensor.accelerometer" android:required="false" />
+    <uses-feature android:name="android.hardware.sensor.gyroscope" android:required="false" />
+
+    <!-- API 30+ 包可见性：UpdateChecker.install 用 queryIntentActivities 显式指到系统
+         安装器（手表实测 content:// APK 意图有三家平权认领，不指定会被文件管理器接走） -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:mimeType="application/vnd.android.package-archive" />
+        </intent>
+    </queries>
 
     <application
-        android:name=".NetMusicLiteApp"
+        android:name=".WmusicApp"
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
@@ -60,5 +85,16 @@
                 <action android:name="androidx.media3.session.MediaSessionService" />
             </intent-filter>
         </service>
+
+        <!-- 应用内更新：把应用私有目录里的更新包 APK 暴露给系统安装器（UpdateChecker.install） -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.updatefileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 </manifest>

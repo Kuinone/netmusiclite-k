@@ -6,15 +6,24 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFontFamilyResolver
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.sp
 
 /**
@@ -79,6 +88,8 @@ private val DarkPalette = NcmPalette(
 // ⚠ 底色刻意压到 0xFFEFEFF3 而不是更亮的 #F6F6F9：手表上没有阴影可用（项目用描边+材质
 //   区分层级），底色若太接近纯白，「白卡叠白底」会糊成一片、所有卡片边界消失。
 //   压到 239 这档后，白卡（≈254）与底色的差值约 15/255，肉眼可辨。
+private val M3ePalette = DarkPalette.copy(bg = Color.Black, bgElevated = Color(0xFF1C1C1C), glass = Color(0xFF1C1C1C), strong = Color(0xFF292929))
+
 private val LightPalette = NcmPalette(
     light = true,
     bg = Color(0xFFEFEFF3),
@@ -97,11 +108,11 @@ private val LightPalette = NcmPalette(
  * 所以任何在 @Composable 里读它的地方都会自动注册依赖 —— 换主题即整树重组。
  */
 val palette: NcmPalette
-    get() = if (com.netmusiclite.data.AppearancePrefs.isLight) LightPalette else DarkPalette
+    get() = if (com.netmusiclite.data.AppearancePrefs.isM3e) M3ePalette else if (com.netmusiclite.data.AppearancePrefs.isLight) LightPalette else DarkPalette
 
 /** 当前是否浅色。供背景取色、系统栏适配等非组件代码判断明暗方向。 */
 val isLightTheme: Boolean
-    get() = com.netmusiclite.data.AppearancePrefs.isLight
+    get() = !com.netmusiclite.data.AppearancePrefs.isM3e && com.netmusiclite.data.AppearancePrefs.isLight
 
 // ════════════════════════════════════════════════════════════════════════════
 //  强调色（M3 种子色）
@@ -174,18 +185,56 @@ val EffectiveSeed: Color
     get() {
         val accent = com.netmusiclite.data.AppearancePrefs.accent
         if (!com.netmusiclite.data.AppearancePrefs.dynamicColor) return accent
-        return com.netmusiclite.data.BackgroundStore.seedColor
+        // ★ 2026-10-07 用户 bug「选择自定义图片后，封面模糊主题浅色下玻璃卡片不生效，
+        //   卡片和取色仍然跟随自定义图片」：壁纸主色只在壁纸**真的在画**时才作为色源 ——
+        //   封面模糊顶掉壁纸（全背景封面模糊）时，底是封面模糊底，强调色必须跟封面走
+        //   （下两级的 SongAmbient.rawColor 就是它），否则就是「底随歌、色随一张没露面的图」。
+        val wallSeed = if (com.netmusiclite.ui.components.wallpaperShown())
+            com.netmusiclite.data.BackgroundStore.seedColor else null
+        return wallSeed
             ?: com.netmusiclite.ui.components.SongAmbient.rawColor
             ?: accent
     }
 
 // ---- 全局强调色（动态）：种子来自 EffectiveSeed（预设色或动态取色），读的是 Compose 状态，
 // 所有组合中读取 Accent 的地方都会在换色 / 换明暗 / 换背景图时自动重组 ----
+/** 按指定明暗求强调色（对调作用域复用；全局 [Accent] 传 isLightTheme） */
+private fun resolveAccent(light: Boolean): Color {
+    val seed = EffectiveSeed
+    return if (light) seed.boostForLight() else seed.boostForDark()
+}
+
 val Accent: Color
-    get() {
-        val seed = EffectiveSeed
-        return if (isLightTheme) seed.boostForLight() else seed.boostForDark()
+    get() = resolveAccent(isLightTheme)
+
+/**
+ * **歌曲主题色**（2026-10-06 用户口径）：「取色 / 封面模糊」两种播放页面风格下，
+ * 歌词墨色与进度类元素（右缘进度弧 / 长按进度条）改跟**专辑封面主题色**。
+ *
+ * 为什么需要这一支：[EffectiveSeed] 的优先级是「壁纸主色 → 封面主色 → 预设种子」——
+ * 一旦设了自定义壁纸，歌词与进度弧就永远跟着**壁纸**走；可这两种风格下页面底其实是
+ * 跟着**歌**走的（取色 = 歌曲环境色，封面模糊 = 封面模糊底），底随歌、字与进度却随壁纸，
+ * 换歌时就是「底变了、字和进度条没变」的撕裂感。
+ *
+ * 边界：
+ *  · 没设壁纸时本值恒等于 [Accent]（EffectiveSeed 本来就取封面色），零差异；
+ *  · 自定义风格（页面透出壁纸）**仍然跟壁纸** —— 与页面底保持一致；
+ *  · 自动取色关闭时回落 [EffectiveSeed]（= 用户预设种子色），不抢用户的固定色；
+ *  · 封面取色还没出结果（刚启动 / 无歌 / 取色失败）时同样回落，永不空转。
+ */
+/** 按指定明暗求歌曲主题色（对调作用域复用；全局 [SongAccent] 传 isLightTheme） */
+private fun resolveSongAccent(light: Boolean): Color {
+    val song = com.netmusiclite.ui.components.SongAmbient.rawColor
+    val seed = if (com.netmusiclite.data.AppearancePrefs.dynamicColor && song != null) {
+        song
+    } else {
+        EffectiveSeed
     }
+    return if (light) seed.boostForLight() else seed.boostForDark()
+}
+
+val SongAccent: Color
+    get() = resolveSongAccent(isLightTheme)
 
 /** 强调色柔光底：白色等浅色种子下改用深色半透明 ——
  *  否则「白字 + 白 20% 底」在玻璃卡上完全糊掉（2026-10-01 主题可读性修复）。
@@ -197,9 +246,12 @@ val AccentSoft: Color
         else -> Accent.copy(alpha = 0.2f)
     }
 
+/** 实底上的反色内容：底色够亮时切深字、否则白字（实底强调色 / 胶囊选中态共用） */
+fun onColorFor(c: Color): Color = if (c.luminance() > 0.75f) Color(0xFF111111) else Color.White
+
 /** 实底强调色上的内容色：主题色为浅色（如白色）时自动切深字，保证对比度 */
 val OnAccent: Color
-    get() = if (Accent.luminance() > 0.75f) Color(0xFF111111) else Color.White
+    get() = onColorFor(Accent)
 
 // ════════════════════════════════════════════════════════════════════════════
 //  歌词文字取色（2026-10-01）
@@ -239,6 +291,26 @@ private const val LYRIC_MIN_CONTRAST = 4.5f
  */
 private const val LYRIC_MIN_CONTRAST_DYNAMIC_LIGHT = 3.2f
 
+/**
+ * ★ 2026-10-10 封面模糊主题的歌词对比度下限（3.5:1）。
+ *
+ * 用户口径：「封面模糊主题的歌词取色经常为纯白导致扫光效果无法显示」。
+ *
+ * 成因：封面模糊底被 backdropScrim 归一化到**固定亮度**（深色 ≈0.14 / 浅色 ≈0.50），
+ * 而 4.5:1 在亮度 0.14 的底上要求墨色亮度 ≥0.805 —— 那就是「极淡的近白」。
+ * 扫光（LyricsScreen 的 drawLyricSweep）本身是**纯白**光斑，
+ * 扫过近白字形时亮度差趋近 0 ⇒ 视觉上「扫光没了」。
+ *
+ * 放宽到 3.5:1 ⇒ 墨色只需 ≈0.62，**保住封面色彩度、留出 ≈0.38 的亮度余量**，
+ * 白光扫过时清晰可见。
+ *
+ * 可读性依据：聚焦行是 15sp / W900，远超 WCAG「大字号」（≥14pt 粗体）的定义，
+ * 大字号的 AA 线就是 3:1，取 3.5 留余量（与 [LYRIC_MIN_CONTRAST_DYNAMIC_LIGHT] 同思路）。
+ * 另：封面模糊底的局部起伏远小于自定义壁纸（后者实测同屏 1.2:1~5.2:1），
+ * 单点标定在这种「被压平的底」上比透壁纸场景更可靠。
+ */
+private const val LYRIC_MIN_CONTRAST_COVER_BLUR = 3.5f
+
 /** WCAG 相对对比度（两色互换不影响结果） */
 private fun contrastRatio(a: Color, b: Color): Float {
     val la = a.luminance()
@@ -274,18 +346,46 @@ private fun contrastRatio(a: Color, b: Color): Float {
  *
  * @param backdrop 歌词页的真实底色（环境色模式取 SongAmbient.color；
  *                 有自定义背景图且没开「保留取色」时页面透出背景图，按 [Bg] 标定）
+ * @param seed 色源：默认 [Accent]（全站强调色）；「取色 / 封面模糊」两种播放风格下
+ *             由 LyricsScreen 传 [SongAccent] —— 那两种风格页面底跟着歌走，
+ *             歌词也该跟着**封面**走（见 [SongAccent] 的注释）
+ * @param light 按哪个明暗标定可读性下限：默认全局主题；「封面模糊明暗对调」开启时
+ *              播放页由 [PlayToneScope] 语义传到（见 [playLightTheme]）
  */
-fun lyricInk(backdrop: Color): Color {
-    val seed = Accent
-    // 浅色 + 自动取色：放宽对比度下限提亮墨色（见 LYRIC_MIN_CONTRAST_DYNAMIC_LIGHT 的推导）；
-    // 其余组合（深色主题 / 浅色 + 预设种子色）维持原 4.5:1 标定不变。
-    val floor = if (isLightTheme && com.netmusiclite.data.AppearancePrefs.dynamicColor) {
-        LYRIC_MIN_CONTRAST_DYNAMIC_LIGHT
-    } else {
-        LYRIC_MIN_CONTRAST
+fun lyricInk(
+    backdrop: Color,
+    seed: Color = Accent,
+    light: Boolean = isLightTheme,
+    /** ★ 2026-10-10 封面模糊主题：下限放宽到 [LYRIC_MIN_CONTRAST_COVER_BLUR]（保住扫光可见性） */
+    coverBlur: Boolean = false,
+): Color {
+    // 对比度下限按场景取：
+    //  · 封面模糊       —— 3.5:1（见 LYRIC_MIN_CONTRAST_COVER_BLUR：既保可读、又让白扫光看得出来）；
+    //  · 浅色 + 自动取色 —— 3.2:1（提亮墨色，见 LYRIC_MIN_CONTRAST_DYNAMIC_LIGHT 的推导）；
+    //  · 其余           —— 4.5:1。
+    val floor = when {
+        coverBlur -> LYRIC_MIN_CONTRAST_COVER_BLUR
+        light && com.netmusiclite.data.AppearancePrefs.dynamicColor -> LYRIC_MIN_CONTRAST_DYNAMIC_LIGHT
+        else -> LYRIC_MIN_CONTRAST
     }
     if (contrastRatio(seed, backdrop) >= floor) return seed
-    val toward = if (backdrop.luminance() > 0.5f) Color.Black else Color.White
+    // ★ 2026-10-07 修复「浅色主题下歌词发白不可读」：方向阈值原为 0.5，但黑/白两条
+    //   方向的对比度分水岭其实在亮度 ≈0.179（(L+0.05)² = 1.05×0.05 ⇒ L ≈ 0.179，
+    //   比它亮 → 朝黑压更容易达标；比它暗 → 朝白提）。
+    //   封面模糊底的标定灰 0xFFBABABA 亮度恰为 0.49 —— 旧阈值下被判为「暗底」朝白提，
+    //   而白比 0.49 的底还亮，对比度永远够不到下限，循环空跑 20 步后直接返回纯白：
+    //   浅色 + 封面模糊下的歌词整列发白（用户口径「保证可读性」）。
+    //   换成 0.18 后：0.49 的底朝黑压（正常路径），深色主题的 0x696969（亮度 0.14）
+    //   仍然朝白提，其余路径（环境色底很亮/很暗）方向不变。
+    val toward = if (backdrop.luminance() > 0.18f) Color.Black else Color.White
+    // ★ 2026-10-10 用户口径「取色取到深色的封面模糊主题的时候歌词一直是白色」：
+    //   「朝白插值」把三个通道**分别**往 255 推 ⇒ 通道差被压平 = 去饱和，颜色越插越白 ——
+    //   深色封面的 seed 本来偏暗，要提到达标的亮度就几乎全白，光调下限治不好。
+    //   封面模糊主题改用**等比缩放**：色相保留、通道差被拉开（饱和度不降反升），
+    //   墨色是「有颜色的亮色」，既够可读、又不再是死白，白色扫光扫过也有对比。
+    if (coverBlur) {
+        scaleInk(seed, backdrop, floor, up = toward == Color.White)?.let { return it }
+    }
     var t = 0.05f
     while (t < 1f) {
         val c = lerp(seed, toward, t)
@@ -293,6 +393,32 @@ fun lyricInk(backdrop: Color): Color {
         t += 0.05f
     }
     return toward
+}
+
+/**
+ * 等比缩放着色：把 [seed] 的 RGB **同比**放大（[up]）/ 缩小，直到对 [backdrop] 的对比度
+ * ≥ [floor]；达不到（seed 无彩度、或缩放到边界）返回 null，交调用方的插值兜底。
+ *
+ * 与 `lerp(seed, toward, t)` 的本质差异：
+ *  · lerp —— 三通道各自朝 255（或 0）线性插值，通道差被压缩 ⇒ **去饱和**，越插越白/越灰；
+ *  · 等比 —— 三通道乘同一个系数，通道差同比例拉开 ⇒ **色相不变、饱和度不降**，
+ *    得到的是「更亮的蓝 / 更深的蓝」，而不是「更白的蓝」。
+ * 这正是「封面模糊主题下歌词不该是死白」的关键。
+ */
+private fun scaleInk(seed: Color, backdrop: Color, floor: Float, up: Boolean): Color? {
+    var k = 1f
+    var guard = 0
+    while (guard++ < 200) {
+        k += if (up) 0.08f else -0.06f
+        if (k <= 0.02f || k >= 14f) return null
+        val c = Color(
+            (seed.red * k).coerceIn(0f, 1f),
+            (seed.green * k).coerceIn(0f, 1f),
+            (seed.blue * k).coerceIn(0f, 1f),
+        )
+        if (contrastRatio(c, backdrop) >= floor) return c
+    }
+    return null
 }
 
 // ---- 语义色（随明暗换深浅，保证在各自底色上都可读）----
@@ -313,6 +439,72 @@ val TextPrimary: Color get() = palette.textPrimary
 val TextSecondary: Color get() = palette.textSecondary
 val TextTertiary: Color get() = palette.textTertiary
 val Separator: Color get() = palette.separator
+
+// ════════════════════════════════════════════════════════════════════════════
+//  播放器组明暗作用域（2026-10-07 用户口径「封面模糊明暗对调」）
+// ════════════════════════════════════════════════════════════════════════════
+//
+// 用户口径：「深色外观 + 播放页风格封面模糊 → 开关『使用浅色封面模糊』；
+//   浅色外观 + 封面模糊 → 开关『使用深色封面模糊』」——开 = 播放器组三页
+//   （播放页 / 歌词页 / 更多页）整体走另一种明暗（底图打光 + 墨色 + 卡片）。
+//
+// 为什么用 CompositionLocal 做**页面作用域**而不是一个全局开关：
+//   全局开关在路由边界会露出破绽 —— 进播放页时身后的主页当场换色、
+//   离开播放页时正在滑出的页面中途翻色。作用域挂在三个页面根上，
+//   页面外的一切（主页、设置、列表…）永远读全局主题，零闪烁。
+//
+// 页面内的取色走下面的 Play* 变体（与全局同名色一一对应），
+// 不在 [PlayToneScope] 里时 `LocalPlayLight.current == null` ⇒ 恒等于全局值，
+// 所以所有 Play* 变体在作用域外零行为差异。
+
+/** 播放器组明暗（null = 不在作用域内，回落全局主题） */
+private val LocalPlayLight = compositionLocalOf<Boolean?> { null }
+
+/**
+ * 当前作用域下的「播放器组明暗」：不在 [PlayToneScope] 里 = 全局主题明暗 [isLightTheme]。
+ * 页面内的明暗判断（卡片、文字、底图打光）应读它而不是 [isLightTheme]。
+ */
+val playLightTheme: Boolean
+    @Composable get() = LocalPlayLight.current ?: isLightTheme
+
+/**
+ * 播放器组三页的根作用域：对调开关生效时把「播放器组明暗」翻到全局的反面。
+ * 开关关闭时**不挂 Provider**（Local 保持 null），零额外开销、零行为差异。
+ */
+@Composable
+fun PlayToneScope(content: @Composable () -> Unit) {
+    if (com.netmusiclite.data.AppearancePrefs.isM3e || !com.netmusiclite.data.AppearancePrefs.coverBlurToneFlip) {
+        content()
+        return
+    }
+    CompositionLocalProvider(LocalPlayLight provides !isLightTheme, content = content)
+}
+
+/** 作用域色板：对调时取另一套明暗的色板（作用域外 = [palette]） */
+@Composable
+private fun playPalette(): NcmPalette = if (playLightTheme) LightPalette else DarkPalette
+
+val PlayBg: Color
+    @Composable get() = playPalette().bg
+
+/** 抬升表面（★ 2026-10-16 深色石墨卡片素底用；对调作用域内取另一套板） */
+val PlayBgElevated: Color
+    @Composable get() = playPalette().bgElevated
+
+val PlaySurfaceGlass: Color
+    @Composable get() = playPalette().glass
+val PlaySurfaceGlassBorder: Color
+    @Composable get() = playPalette().glassBorder
+val PlayTextPrimary: Color
+    @Composable get() = playPalette().textPrimary
+val PlayTextSecondary: Color
+    @Composable get() = playPalette().textSecondary
+val PlayTextTertiary: Color
+    @Composable get() = playPalette().textTertiary
+val PlayAccent: Color
+    @Composable get() = resolveAccent(playLightTheme)
+val PlaySongAccent: Color
+    @Composable get() = resolveSongAccent(playLightTheme)
 
 /**
  * 页面底色：恒透明（2026-09-04 流畅度专项 R1）。
@@ -520,6 +712,10 @@ private fun buildColorScheme(pal: NcmPalette, accent: Color): ColorScheme {
 
 @Composable
 fun NcmTheme(content: @Composable () -> Unit) {
+    // Preserve the navigation/saveable subtree when switching between the two independent themes.
+    val latestContent = androidx.compose.runtime.rememberUpdatedState(content)
+    val preservedContent = remember { androidx.compose.runtime.movableContentOf { latestContent.value() } }
+
     // 把系统深浅同步到偏好（「跟随系统」模式已从设置页移除，这里保留同步做防御）。
     // 用 SideEffect 而不是组合期直接赋值 —— 组合期写状态是反模式（可能触发重组环）。
     // 首次启动的初值由 AppearancePrefs.init() 从 Configuration 读出，所以不会有一帧错色。
@@ -531,5 +727,87 @@ fun NcmTheme(content: @Composable () -> Unit) {
     //   DynamicSeed.systemColor）已随「删掉系统壁纸效果」整体移除。
 
     val accent = Accent
-    MaterialTheme(colorScheme = buildColorScheme(pal, accent), content = content)
+
+    // ★ 2026-10-03 字体大小/粗细（设置主题页两个滑块，用户口径）：
+    //   大小 → 覆写 LocalDensity.fontScale：所有文本都按 sp 定义，一处覆写全局生效；
+    //   粗细 → 换用自建 FontFamily.Resolver（内置官方 AndroidFontResolveInterceptor
+    //   平移字重，见 FontWeightShift.kt）—— Resolver 是 sealed 不能包装，只能整只替换。
+    //   ⚠ 两个 remember 的 key 必须含用户值：解析器实例与 density 都参与文本版式缓存键，
+    //   不换实例则滑块拖了不生效（旧版式会被原样复用）。
+    val baseDensity = LocalDensity.current
+    val baseResolver = LocalFontFamilyResolver.current
+    val appContext = LocalContext.current.applicationContext
+    val scale = com.netmusiclite.data.AppearancePrefs.fontScale
+    val weightLevel = com.netmusiclite.data.AppearancePrefs.fontWeightLevel
+    // ★ 2026-10-03 屏幕尺寸自适应（用户口径「466x466 分辨率之外的手表会存在组件位移」）：
+    //   整套 UI 的 dp 值是按 466×466 / density 2.0 = **233dp** 的设计基准写死的。换到别的
+    //   dp 尺寸（三星 40mm 198dp、Ticwatch 227dp、Galaxy Watch 6 44mm 240dp…）后，同样
+    //   的固定 dp 在屏上占比不同，居中/贴边/留白全部错位 —— 就是用户看到的「组件位移」。
+    //   修法是**整体等比缩放**：把 LocalDensity.density 乘上「屏宽 / 设计基准」，
+    //   让 233dp 的设计在任何屏上都恰好铺满短边，所有 dp 与 sp 一起等比 ——
+    //   零散落改动（不必去逐个文件改 dp），触摸/命中测试也跟着缩放，不会错位。
+    //   基准屏（本机 466×466）uiScale = 1.0 ⇒ density 与旧版**完全一致**，一个像素不变。
+    //   ⚠ 代价：LocalConfiguration.screenWidthDp 是「系统 dp」，缩放后不再等于屏宽 ——
+    //     凡是要「屏幕尺寸」的地方必须改走 screenWidthUiDp()/screenHeightUiDp()（见 Common.kt）。
+    val uiScale = screenUiScale()
+    val density = remember(baseDensity, scale, uiScale) {
+        val d = baseDensity.density * uiScale
+        val f = baseDensity.fontScale * DEFAULT_TEXT_SCALE * scale
+        if (d == baseDensity.density && f == baseDensity.fontScale) baseDensity
+        else Density(d, f)
+    }
+    val resolver = remember(baseResolver, weightLevel) {
+        val shift = FONT_WEIGHT_SHIFTS.getOrElse(weightLevel) { 0 }
+        if (shift == 0) baseResolver else shiftedFontFamilyResolver(appContext, shift)
+    }
+    CompositionLocalProvider(
+        LocalDensity provides density,
+        LocalClockFontScale provides baseDensity.fontScale,
+        // 缩放系数供「屏幕尺寸换算」使用（screenWidthUiDp 等），值极少变 → static 更省开销
+        LocalUiScale provides uiScale,
+        LocalFontFamilyResolver provides resolver,
+    ) {
+        if (com.netmusiclite.data.AppearancePrefs.isM3e) {
+            com.netmusiclite.ui.m3e.M3eTheme(EffectiveSeed, preservedContent)
+        } else {
+            MaterialTheme(colorScheme = buildColorScheme(pal, accent), content = preservedContent)
+        }
+    }
 }
+
+/**
+ * 设计基准：短边 466px @ density 2.0 = **233dp**。
+ * 全部布局 dp / sp 都是照这个尺寸标定的（圆屏弧边内缩、140dp 演示区、46dp 圆钮…）。
+ */
+const val DESIGN_SCREEN_DP = 233f
+
+/** 100% in settings uses the enlarged application baseline. */
+private const val DEFAULT_TEXT_SCALE = 1.06f
+
+/**
+ * 全局 UI 缩放系数 = 屏幕短边 dp / [DESIGN_SCREEN_DP]。
+ *
+ * 在 [NcmTheme] 里乘进 LocalDensity.density（布局与字体一起等比），并作为
+ * [LocalUiScale] 下发给「屏幕尺寸换算」（screenWidthUiDp / screenHeightUiDp）。
+ *
+ * 夹取 [0.60, 1.50]：覆盖 140dp~350dp 的短边区间，异常上报值不会把界面缩到不可用。
+ * 读的是 [LocalConfiguration]（系统配置，不受本函数下游的 density 覆写影响）——
+ * 所以这里拿到的恒是**真实**的屏幕 dp 尺寸，不会自我循环。
+ */
+@Composable
+fun screenUiScale(): Float {
+    val cfg = LocalConfiguration.current
+    val shortDp = minOf(cfg.screenWidthDp, cfg.screenHeightDp).toFloat()
+    if (shortDp <= 0f) return 1f
+    return (shortDp / DESIGN_SCREEN_DP).coerceIn(0.60f, 1.50f)
+}
+
+/**
+ * 当前生效的 UI 缩放系数（[NcmTheme] 注入）。
+ * 默认 1f —— 在 [NcmTheme] 之外（预览 / 单测）读到的是恒等缩放。
+ */
+val LocalUiScale = staticCompositionLocalOf { 1f }
+
+/** System clock keeps its original font size independently of application text settings. */
+val LocalClockFontScale = staticCompositionLocalOf { 1f }
+

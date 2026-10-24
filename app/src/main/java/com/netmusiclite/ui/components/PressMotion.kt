@@ -22,10 +22,10 @@ import androidx.compose.animation.core.spring
  * 对称内缩，中心零漂移），等比缩放（水平 0.938 / 垂直 0.936）。
  *
  * ## 与轻舟的有意差异
- * 1. **幅度**：轻舟 0.96，这里取 [SCALE] = 0.93。用户明确要求「所有界面的卡片下沉效果
- *    更明显」，0.96 在 466px 圆屏上只有 2px 级位移，几乎看不出。
+ * 1. **幅度**：轻舟 0.96，原取 0.93；现在按用户要求将行程增强 20%：
+ *    [SCALE] = 1 - 0.07 × 1.2 = 0.916。横展/竖压同步由 4% 增至 4.8%。
  * 2. **松开过冲**：轻舟松开是单调回位、零过冲；这里用低阻尼弹簧做出**可见回弹**——
- *    用户明确要求「点击回弹」。按 [UP] 的阻尼比，行程 7% 会过冲到约 1.024。
+ *    用户明确要求「点击回弹」。按 [UP] 的阻尼比，行程 8.4% 会过冲到约 1.029。
  *
  * ## 为什么按下/松开要用两条不同的曲线
  * 旧实现按下和松开共用 `spring(dampingRatio = 0.55, stiffness = 900)`：ω = √900 = 30 rad/s，
@@ -35,8 +35,8 @@ import androidx.compose.animation.core.spring
  */
 internal object PressMotion {
 
-    /** 按下缩到的比例。轻舟实测 0.9605；按要求加码到 0.93 让下沉可见。 */
-    const val SCALE = 0.93f
+    /** 旧 7% 行程增强 20%，scalar 与挤压变形共用，不能再重复乘增益。 */
+    const val SCALE = 0.916f
 
     /**
      * 按下：阻尼比 0.72（近临界阻尼，几乎无过冲）+ ω≈20.5 rad/s —— 约 200ms 匀速沉下去。
@@ -47,7 +47,7 @@ internal object PressMotion {
 
     /**
      * 松开：阻尼比 0.32 → 过冲 exp(-πζ/√(1-ζ²)) ≈ 34.6% 行程，
-     * 7% 的行程对应峰值 1.024，肉眼可辨的回弹；随后两次小余振收干净。
+     * 8.4% 的行程对应峰值 1.029，肉眼可辨的回弹；随后两次小余振收干净。
      */
     val UP: FiniteAnimationSpec<Float> =
         spring(dampingRatio = 0.32f, stiffness = 560f)
@@ -55,6 +55,10 @@ internal object PressMotion {
     /** 按状态取曲线：按住用 [DOWN]，松开用 [UP]。 */
     fun spec(pressed: Boolean): FiniteAnimationSpec<Float> = if (pressed) DOWN else UP
 
-    /** 按下缩到的比例（等比，图形层直接写 scaleX/scaleY）。 */
+    /** Same mapping as before: 8.4% scalar travel now produces 4.8% squash/stretch. */
+    fun stretchX(scale: Float): Float = 1f + (1f - scale) * (4f / 7f)
+    fun stretchY(scale: Float): Float = 1f - (1f - scale) * (4f / 7f)
+
+    /** Legacy scalar retained for callers and custom cover-button gesture handling. */
     fun targetScale(pressed: Boolean): Float = if (pressed) SCALE else 1f
 }

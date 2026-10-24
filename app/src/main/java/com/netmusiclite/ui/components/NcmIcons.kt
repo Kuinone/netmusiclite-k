@@ -1,5 +1,8 @@
 package com.netmusiclite.ui.components
 
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.*
+import com.netmusiclite.data.AppearancePrefs
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
@@ -10,6 +13,106 @@ import androidx.compose.ui.graphics.vector.path
 import androidx.compose.ui.unit.dp
 
 /**
+ * Theme-aware icon facade. M3E uses the official Material Icons Rounded library.
+ * Read the preference on every access so Compose observes theme changes. Classic
+ * vectors stay lazy and keep their original paths, geometry and tint behavior.
+ */
+object NcmIcons {
+    val Search: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.Search else ClassicNcmIcons.Search
+    val NowPlaying: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.GraphicEq else ClassicNcmIcons.NowPlaying
+    val DailyRec: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.CalendarMonth else ClassicNcmIcons.DailyRec
+    val Heart: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.FavoriteBorder else ClassicNcmIcons.Heart
+    val HeartFill: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.Favorite else ClassicNcmIcons.HeartFill
+    val Playlist: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.LibraryMusic else ClassicNcmIcons.Playlist
+    val LocalMusic: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.MusicNote else ClassicNcmIcons.LocalMusic
+    val Recognize: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.Mic else ClassicNcmIcons.Recognize
+    val Roam: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.Explore else ClassicNcmIcons.Roam
+    val Friends: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.People else ClassicNcmIcons.Friends
+    val Settings: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.Settings else ClassicNcmIcons.Settings
+    val ChevronLeft: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.ChevronLeft else ClassicNcmIcons.ChevronLeft
+    val ChevronRight: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.ChevronRight else ClassicNcmIcons.ChevronRight
+    val Close: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.Close else ClassicNcmIcons.Close
+    val Plus: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.Add else ClassicNcmIcons.Plus
+    val Check: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.Check else ClassicNcmIcons.Check
+    val CheckAll: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.DoneAll else ClassicNcmIcons.CheckAll
+    val Volume: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.VolumeUp else ClassicNcmIcons.Volume
+    val MoreDots: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.MoreHoriz else ClassicNcmIcons.MoreDots
+    val Trash: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.Delete else ClassicNcmIcons.Trash
+    val Download: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.Download else ClassicNcmIcons.Download
+    val Repeat: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.Repeat else ClassicNcmIcons.Repeat
+    val Shuffle: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.Shuffle else ClassicNcmIcons.Shuffle
+    val SingleLoop: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.RepeatOne else ClassicNcmIcons.SingleLoop
+    val HeartMode: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.MonitorHeart else ClassicNcmIcons.HeartMode
+    val QueueList: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.QueueMusic else ClassicNcmIcons.QueueList
+    val Bookmark: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.BookmarkBorder else ClassicNcmIcons.Bookmark
+    val Star: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.StarBorder else ClassicNcmIcons.Star
+    val Send: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.Send else ClassicNcmIcons.Send
+    val ImageIc: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.Image else ClassicNcmIcons.ImageIc
+    val Together: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.Group else ClassicNcmIcons.Together
+    val Refresh: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.Refresh else ClassicNcmIcons.Refresh
+    val Play: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.PlayArrow else ClassicNcmIcons.Play
+    val Pause: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.Pause else ClassicNcmIcons.Pause
+    val Next: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.SkipNext else ClassicNcmIcons.Next
+    val Prev: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.SkipPrevious else ClassicNcmIcons.Prev
+    val Note: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.MusicNote else ClassicNcmIcons.Note
+    val Qr: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.QrCodeScanner else ClassicNcmIcons.Qr
+    val Moon: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.Bedtime else ClassicNcmIcons.Moon
+    val Chart: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.BarChart else ClassicNcmIcons.Chart
+    val CommentIc: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.ChatBubbleOutline else ClassicNcmIcons.CommentIc
+    val Copy: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.ContentCopy else ClassicNcmIcons.Copy
+    val History: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.History else ClassicNcmIcons.History
+    val Theme: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.Contrast else ClassicNcmIcons.Theme
+    val Info: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.Info else ClassicNcmIcons.Info
+    val Watch: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.Watch else ClassicNcmIcons.Watch
+}
+
+/**
  * 全套手绘矢量图标（24 视口，白色绘制，Icon(tint) 统一着色）。
  *
  * ★ 全部 by lazy（2026-09-30 冷启动专项）：NcmIcons 是 object，Kotlin 首次访问任意一个属性
@@ -17,7 +120,7 @@ import androidx.compose.ui.unit.dp
  *   全部构建（每个都要跑 ImageVector.Builder + PathBuilder），是冷启动首帧组合里的一块
  *   可观开销。改成 by lazy 后只构建真正用到的那几个（启动路径不到 10 个）。
  */
-object NcmIcons {
+private object ClassicNcmIcons {
 
     private fun icon(name: String, block: ImageVector.Builder.() -> Unit): ImageVector =
         ImageVector.Builder(
@@ -77,6 +180,12 @@ object NcmIcons {
         s(3.6f) { moveTo(16f, 15f); lineTo(16f, 15.01f) }
     } }
 
+    val Recognize: ImageVector by lazy { icon("Recognize") {
+        s(4.6f) { moveTo(12f, 5.8f); lineTo(12f, 11.2f) }
+        s { moveTo(7.6f, 11f); curveTo(7.6f, 13.8f, 9.5f, 15.8f, 12f, 15.8f); curveTo(14.5f, 15.8f, 16.4f, 13.8f, 16.4f, 11f) }
+        s { moveTo(12f, 15.8f); lineTo(12f, 19.2f) }
+        s { moveTo(9f, 19.2f); lineTo(15f, 19.2f) }
+    } }
 
     val Roam: ImageVector by lazy { icon("Roam") {
         f { moveTo(12f, 3.2f); lineTo(17.2f, 19.4f); lineTo(12f, 15.6f); lineTo(6.8f, 19.4f); close() }
@@ -119,6 +228,13 @@ object NcmIcons {
 
     val Check: ImageVector by lazy { icon("Check") {
         s { moveTo(4.5f, 12.5f); lineTo(9.8f, 17.8f); lineTo(19.5f, 6.8f) }
+    } }
+
+    /** 全选：上下两个勾叠在一起（2026-10-03 用户口径）——单勾留给确认/导入等动作，
+     *  多选态里「全选」一眼可辨；两勾平行错开 6.4（笔触互不相交，缩到 14dp 仍有间隙） */
+    val CheckAll: ImageVector by lazy { icon("CheckAll") {
+        s { moveTo(4.5f, 9f); lineTo(9.8f, 14.3f); lineTo(19.5f, 3.3f) }
+        s { moveTo(4.5f, 15.4f); lineTo(9.8f, 20.7f); lineTo(19.5f, 9.7f) }
     } }
 
     val Volume: ImageVector by lazy { icon("Volume") {
@@ -205,6 +321,11 @@ object NcmIcons {
 
     val Bookmark: ImageVector by lazy { icon("Bookmark") {
         s { moveTo(7f, 4.6f); lineTo(17f, 4.6f); lineTo(17f, 19.8f); lineTo(12f, 15.8f); lineTo(7f, 19.8f); close() }
+    } }
+
+    /** 特别鸣谢（设置入口，2026-10-07）：五角星描边 */
+    val Star: ImageVector by lazy { icon("Star") {
+        s { moveTo(12f, 3.6f); lineTo(14.6f, 8.9f); lineTo(20.4f, 9.7f); lineTo(16.2f, 13.8f); lineTo(17.2f, 19.5f); lineTo(12f, 16.8f); lineTo(6.8f, 19.5f); lineTo(7.8f, 13.8f); lineTo(3.6f, 9.7f); lineTo(9.4f, 8.9f); close() }
     } }
 
     val Send: ImageVector by lazy { icon("Send") {
@@ -313,6 +434,15 @@ object NcmIcons {
         }
         s(2.2f) { moveTo(12f, 11f); lineTo(12f, 16.2f) }
         s(2.6f) { moveTo(12f, 7.3f); lineTo(12f, 7.32f) }
+    } }
+
+    /** 表盘（圆表壳 + 右侧表冠）：设置页「表盘形状」入口（2026-10-03） */
+    val Watch: ImageVector by lazy { icon("Watch") {
+        s(1.8f) {
+            moveTo(12f, 4.2f); arcTo(7.8f, 7.8f, 0f, false, true, 12f, 19.8f)
+            arcTo(7.8f, 7.8f, 0f, false, true, 12f, 4.2f)
+        }
+        s(1.8f) { moveTo(20.6f, 9.9f); lineTo(22f, 9.9f); lineTo(22f, 14.1f); lineTo(20.6f, 14.1f) }
     } }
 
 }

@@ -1,5 +1,7 @@
 package com.netmusiclite.ui.screens.local
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -16,6 +18,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -26,6 +29,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.navigation.NavHostController
 import com.netmusiclite.data.DownloadStore
+import com.netmusiclite.data.ImportStore
 import com.netmusiclite.data.LocalMusic
 import com.netmusiclite.data.PlayerEngine
 import com.netmusiclite.data.Song
@@ -33,6 +37,7 @@ import com.netmusiclite.data.SongQuery
 import com.netmusiclite.ui.components.CenterHint
 import com.netmusiclite.ui.theme.Accent
 import com.netmusiclite.ui.components.ListFilterCard
+import com.netmusiclite.ui.components.MediaPermissions
 import com.netmusiclite.ui.components.rememberAliasAwareSongs
 import com.netmusiclite.ui.components.NcmIcons
 import com.netmusiclite.ui.components.StackedIconCard
@@ -44,11 +49,16 @@ import com.netmusiclite.ui.nav.NavMotionKind
 import com.netmusiclite.ui.nav.NavMotionSpec
 import com.netmusiclite.ui.nav.navigateWithMotion
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /**
- * 本地音乐：设备媒体库 + 应用内已下载合并（歌曲行卡片堆叠）；下载完成自动刷新。
+ * 本地音乐：设备媒体库 + 应用内已下载 + 手动导入合并（歌曲行卡片堆叠）；下载完成自动刷新。
  * 长按进入多选 → 顶部出现删除按钮：
- * 应用内下载的歌曲（音频+歌词）直接删除；系统媒体库文件受系统权限限制不可删，会提示。
+ * 应用内下载（音频+歌词）与手动导入的歌曲可移除；系统媒体库文件受系统权限限制不可删，会提示。
+ *
+ * ★ 2026-10-03 导入入口（用户口径）：最上方「导入本地音乐」→ 内置导入页（扫描设备音乐，
+ *   单选/多选导入，见 ImportLocalScreen）；导入条目只并入本页列表（见 ImportStore 的 KDoc），
+ *   「我喜欢」等歌单不受影响。从导入页返回时本页整体重组合 → 自动重扫，新导入的立即出现。
  */
 @Composable
 fun LocalMusicScreen(nav: NavHostController) {
@@ -67,22 +77,50 @@ fun LocalMusicScreen(nav: NavHostController) {
     suspend fun rescan() {
         songs = LocalMusic.scan(ctx)
         loading = false
+        // ★ 2026-10-06 用户口径「扫描本地音乐后自动查找是否有同名 lrc 读取」：
+        //   扫描完成后在**后台**把每首本地歌的歌词查找跑一遍（旁挂 .lrc / 内嵌帧），
+        //   结果记进 LocalLyricStore 的 memo —— 之后进歌词页秒出，查找成本不再落在
+        //   打开歌词页那一刻。read 自带 memo 检查：查过的歌这里零成本跳过，只有新增 /
+        //   未查过的才真正读文件；全程 IO 线程，不与本页任何 UI 状态交互。
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            com.netmusiclite.data.LocalLyricStore.warmup(ctx, songs)
+        }
     }
     LaunchedEffect(Unit) { rescan() }
     LaunchedEffect(dlTick) { if (dlTick > 0) rescan() }
     LaunchedEffect(toast) { if (toast != null) { delay(3500); toast = null } }
 
+    // ★ 2026-10-04「更新后本地音乐失效」修复之一：音频读取权限一旦被系统/ROM 撤销，
+    //   媒体库查询会**静默返回空**（queryMediaStore 里的 runCatching 吞掉了异常）——
+    //   列表看起来就像「之前导入的歌全没了」。这里显式检测权限，缺失时在列表顶部给出
+    //   可点的授权卡片，授权成功后立刻重扫，不必退出重进。
+    val audioPerm = remember { MediaPermissions.audio() }
+    var permOk by remember { mutableStateOf(MediaPermissions.granted(ctx, audioPerm)) }
+    val permScope = rememberCoroutineScope()
+    val permLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { ok ->
+        permOk = ok
+        if (ok) permScope.launch { rescan() }
+        else toast = "没有音频读取权限，只能看到应用内下载与导入的歌曲"
+    }
+
+    // 系统文件管理（SAF）多选导入入口已迁入内置导入页（2026-10-03，见 ImportLocalScreen）；
+    // 本页「导入本地音乐」卡片改为导航进入该页。
     fun deleteSelected() {
-        val deletable = selected.values.filter { DownloadStore.songOf(it.id) != null }
-        val skipped = selected.size - deletable.size
-        deletable.forEach { DownloadStore.delete(it.id) }
-        val removedIds = deletable.map { it.id }.toSet()
+        val downloaded = selected.values.filter { DownloadStore.songOf(it.id) != null }
+        val importedIds = selected.keys.filter { ImportStore.isImported(ctx, it) }
+        // 媒体库扫描来的系统文件不属于应用资产：既删不了文件，也无「移出列表」的意义
+        val skipped = selected.size - downloaded.size - importedIds.size
+        downloaded.forEach { DownloadStore.delete(it.id) }
+        ImportStore.remove(ctx, importedIds)
+        val removedIds = downloaded.map { it.id }.toSet() + importedIds
         songs = songs.filterNot { it.id in removedIds }
         selected.clear()
         toast = when {
-            deletable.isEmpty() -> "仅支持删除应用内下载的歌曲"
-            skipped > 0 -> "已删除 ${deletable.size} 首；$skipped 首为系统媒体文件不可删"
-            else -> "已删除 ${deletable.size} 首"
+            removedIds.isEmpty() -> "仅支持删除应用内下载或导入的歌曲"
+            skipped > 0 -> "已移除 ${removedIds.size} 首；$skipped 首为系统媒体文件不可移除"
+            else -> "已移除 ${removedIds.size} 首"
         }
     }
 
@@ -91,7 +129,40 @@ fun LocalMusicScreen(nav: NavHostController) {
         var filter by remember { mutableStateOf("") }
         // 跨语言搜索：本地文件没有网易译名，按需"查询扩展 + 别名反查"（详 rememberAliasAwareSongs）
         val visible = rememberAliasAwareSongs(songs, filter)
-        StackedCardList(title = "本地音乐", progressTotal = n + 2, cardHeight = 56.dp, horizontalInsetPx = 10) {
+        StackedCardList(
+            title = "本地音乐",
+            // 权限缺失时列表里多一张授权卡（见上方 permLauncher 说明）
+            progressTotal = n + if (permOk) 3 else 4,
+            cardHeight = 56.dp,
+            horizontalInsetPx = 10,
+        ) {
+            // ★ 2026-10-04 权限缺失时的授权卡片（排在最前）：权限被撤销后媒体库查询静默返回空，
+            //   用户看到的就是「歌全没了」——给一个当场就能恢复的入口，而不是让人以为数据丢了。
+            if (!permOk) {
+                item(key = "perm") {
+                    StackedIconCard(
+                        title = "需要音频读取权限",
+                        subtitle = "点此授权后重新扫描设备音乐",
+                        icon = NcmIcons.Refresh,
+                        iconTint = Accent,
+                        navMotionKind = NavMotionKind.Pill,
+                        onClick = { permLauncher.launch(audioPerm) },
+                    )
+                }
+            }
+            // ★ 2026-10-03 用户口径「本地音乐最上方增添导入本地音乐选项」：
+            //   排在下载管理之上，是列表第一条；点击进入内置导入页（扫描/多选/单选，见 ImportLocalScreen），
+            //   权限在点「扫描本地音乐」那一刻申请，不在进页时弹窗。
+            item(key = "import") {
+                StackedIconCard(
+                    title = "导入本地音乐",
+                    subtitle = "扫描设备歌曲，选择后仅在本页显示",
+                    icon = NcmIcons.Plus,
+                    iconTint = Accent,
+                    navMotionKind = NavMotionKind.Pill,
+                    onClick = { nav.navigateWithMotion(Routes.LOCAL_IMPORT) },
+                )
+            }
             item(key = "dl_mgr") {
                 StackedIconCard(
                     title = "下载管理",

@@ -89,7 +89,7 @@ def gen(mapping_path: str, only_app: bool):
             if "." in name:
                 # 内联帧：属于别的类，输出 dex 里没有独立方法体 —— 写进去必被校验丢掉
                 continue
-            is_app = cur.startswith("com.ncm.watch")
+            is_app = cur.startswith("com.netmusiclite")
             if only_app and not is_app:
                 continue
             try:

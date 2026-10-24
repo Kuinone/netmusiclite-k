@@ -15,7 +15,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.sp
 import androidx.navigation.NavHostController
 import com.netmusiclite.data.PlayerEngine
-import com.netmusiclite.ui.components.CircularSideProgress
 import com.netmusiclite.ui.components.RotatingCover
 import com.netmusiclite.ui.nav.Routes
 import com.netmusiclite.ui.nav.NavMotionKind
@@ -51,9 +50,15 @@ fun PrivateRoamScreen(nav: NavHostController) {
         }
     }
 
+    if (com.netmusiclite.data.AppearancePrefs.isM3e) {
+        com.netmusiclite.ui.m3e.M3eRoamStatus(status) {
+            if (!nav.popBackStack()) nav.navigateWithMotion(Routes.HOME)
+        }
+        return
+    }
+
     Box(Modifier.fillMaxSize().background(screenBg()), contentAlignment = Alignment.Center) {
         RotatingCover(PlayerEngine.current, 120.dp, PlayerEngine.isPlaying)
-        CircularSideProgress(progress = { 0.2f }, modifier = Modifier.fillMaxSize())
         Text(status, fontSize = 11.sp, color = TextSecondary,
             modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 60.dp))
     }

@@ -3,10 +3,36 @@
     <string name="app_name">NetMusicLite</string>
 
     <style name="Theme.NCM" parent="android:Theme.Material.NoActionBar">
-        <item name="android:windowBackground">@color/bg</item>
-        <item name="android:statusBarColor">@color/bg</item>
-        <item name="android:navigationBarColor">@color/bg</item>
-        <item name="android:windowLightStatusBar">false</item>
+        <!-- ★ 2026-10-16 用户口径「四周区域会是白色」：圆屏根布局是 clip(CircleShape)，
+             圆外那四个角露出的**就是 windowBackground**。它原来固定 #EFEFF3（浅色板），
+             于是深色主题下圆外一圈恒为白 —— 页面一缩小、或者进任何页面，四角都白得刺眼。
+             改成透明：圆外露出表盘（App 之外的东西），与本工程「圆屏四角交给系统」的既有
+             口径一致，也不再与主题明暗冲突（静态资源没法跟着 CoverBlur 的自动明暗走）。
+             （colors.xml 的 @color/bg 仍保留给状态栏/导航栏用。） -->
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <!-- ★ 2026-10-18 用户 bug「华强北手表上软件内顶部状态栏区域显示黑色」：
+             这台表（非 Wear/普通 Android 手表）的系统状态栏是**常驻可见**的，而本主题把
+             windowBackground / statusBarColor 都设成透明 —— 状态栏区域于是露出 SurfaceFlinger
+             的默认黑底，顶部就出现一条「有时间/电量图标、底色纯黑」的条；同时 App 没有请求全屏，
+             内容从状态栏下方开始，不会自己盖住那一块。ColorOS Watch（OWW261）上没有这个现象，
+             是因为它的 ROM 在系统层就把状态栏整个隐藏了（dumpsys 里 App 窗口已带 FULLSCREEN）。
+             修法：在主题声明式请求全屏（FLAG_FULLSCREEN），让系统不画状态栏、内容铺满全屏；
+             不遵守该 flag 的 ROM 由 MainActivity.ensureImmersiveFullscreen() 运行时兜底。 -->
+        <item name="android:windowFullscreen">true</item>
+        <!-- 2026-10-03 默认主题浅色：色条图标改深色（与浅色 windowBackground 配对） -->
+        <item name="android:windowLightStatusBar">true</item>
         <item name="android:colorAccent">@color/accent</item>
+        <!-- ★ 2026-10-03（三星魔改 Wear OS 2 / Wear OS 7 / 鸿蒙 4）：
+             Wear 主题里 windowSwipeToDismiss 默认 true —— 从左往右滑会把 Activity 直接
+             finish 掉（用户报的「左右滑动直接退出应用」），且触摸被系统吃掉后应用内
+             SwipeBackBox 一个事件都收不到（左划进歌词 / 右划返回全部失效）。
+             置 false 让系统不再滑动关闭本 Activity，触摸交回应用自身：
+             应用内 SwipeBackBox / PlayerScreen 的横滑手势恢复；系统若仍派发 back，
+             由 MainActivity 注册的 OnBackPressedCallback → SystemBackRouter 接成应用内语义。
+             （官方文档《在 Wear 上退出全屏 activity》的「停用滑动关闭」做法；
+               仅对带 android.hardware.type.watch 的设备生效，其余平台该属性被忽略。） -->
+        <item name="android:windowSwipeToDismiss">false</item>
     </style>
 </resources>

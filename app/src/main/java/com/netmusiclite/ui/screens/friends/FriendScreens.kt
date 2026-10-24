@@ -1,5 +1,8 @@
 package com.netmusiclite.ui.screens.friends
 
+import com.netmusiclite.ui.m3e.adaptiveAnimateScrollToItem
+import com.netmusiclite.ui.m3e.adaptiveScrollToItem
+
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -16,7 +19,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.basicMarquee
-import androidx.compose.foundation.lazy.LazyColumn
+import com.netmusiclite.ui.m3e.AdaptiveLazyColumn as LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
@@ -40,6 +43,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
@@ -48,9 +52,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.navigation.NavHostController
 import com.netmusiclite.data.ChatMessage
+import com.netmusiclite.data.AppearancePrefs
+import com.netmusiclite.data.ChatInvite
 import com.netmusiclite.data.ChatSession
 import com.netmusiclite.data.FriendInfo
 import com.netmusiclite.data.ListenSession
+import com.netmusiclite.data.MsgOrderStore
 import com.netmusiclite.data.NcmApi
 import com.netmusiclite.data.PageCache
 import com.netmusiclite.data.PlayerEngine
@@ -58,6 +65,11 @@ import com.netmusiclite.data.SessionStore
 import com.netmusiclite.data.Song
 import com.netmusiclite.ui.components.CircleIconButton
 import com.netmusiclite.ui.components.CoverImage
+import com.netmusiclite.ui.components.InviteCaption
+import com.netmusiclite.ui.components.ListenInviteCard
+import com.netmusiclite.ui.components.copyOnLongPress
+import com.netmusiclite.ui.components.inviteCaption
+import com.netmusiclite.ui.components.listenInviteOf
 import com.netmusiclite.ui.components.songCoverModel
 import com.netmusiclite.ui.components.NcmIcons
 import com.netmusiclite.ui.components.StackedCard
@@ -75,6 +87,9 @@ import com.netmusiclite.ui.theme.OnAccent
 import com.netmusiclite.ui.theme.SurfaceGlass
 import com.netmusiclite.ui.theme.TextPrimary
 import com.netmusiclite.ui.theme.TextSecondary
+import com.netmusiclite.ui.m3e.M3eContactRow
+import com.netmusiclite.ui.m3e.M3eChatMessage
+import com.netmusiclite.ui.m3e.M3eChatComposer
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -128,6 +143,13 @@ fun FriendsScreen(nav: NavHostController) {
             } else {
                 items(friends, key = { it.id }) { f ->
                     val s = sessions.firstOrNull { it.userId == f.id }
+                    if (AppearancePrefs.isM3e) {
+                        M3eContactRow(f.name, f.avatarUrl, s?.lastText,
+                            if (s != null && s.unread > 0) "${s.unread} 未读" else "聊天",
+                            onClick = { nav.navigateWithMotion(Routes.friendChat(f.id)) },
+                            onProfile = { nav.navigateWithMotion(Routes.userPage(f.id)) })
+                        return@items
+                    }
                     StackedCard(
                         onClick = { nav.navigateWithMotion(Routes.friendChat(f.id)) },
                         navMotionKind = NavMotionKind.Pill,
@@ -180,6 +202,11 @@ fun MessagesScreen(nav: NavHostController) {
     StackedCardList(title = "私信", titleSubtitle = "网易云站内信", progressTotal = sessions?.size ?: -1) {
         val list = sessions
         when {
+            AppearancePrefs.isM3e && failed -> item(key = "m3e-fail") {
+                androidx.wear.compose.material3.Text("私信接口暂不可用\n（网易云可能已下线该功能）",
+                    style = androidx.wear.compose.material3.MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 24.dp))
+            }
             list == null -> item(key = "loading") {
                 Text("加载中…", fontSize = 11.sp, color = TextSecondary,
                     modifier = Modifier.fillMaxWidth().padding(top = 140.dp), textAlign = TextAlign.Center)
@@ -193,6 +220,14 @@ fun MessagesScreen(nav: NavHostController) {
                     modifier = Modifier.fillMaxWidth().padding(top = 120.dp), textAlign = TextAlign.Center)
             }
             else -> items(list, key = { it.userId }) { s ->
+                if (AppearancePrefs.isM3e) {
+                    // ★ 2026-10-22 用户口径⑤：私信会话列表同样支持点头像进主页（与好友列表一致）
+                    M3eContactRow(s.name, s.avatarUrl, s.lastText.ifEmpty { "—" },
+                        if (s.unread > 0) "${s.unread} 未读" else shortTime(s.timeMs),
+                        onClick = { nav.navigateWithMotion(Routes.friendChat(s.userId)) },
+                        onProfile = { nav.navigateWithMotion(Routes.userPage(s.userId)) })
+                    return@items
+                }
                 StackedCard(
                     onClick = { nav.navigateWithMotion(Routes.friendChat(s.userId)) },
                     navMotionKind = NavMotionKind.Pill,
@@ -233,6 +268,8 @@ fun ChatScreen(nav: NavHostController, friendId: Long) {
     var failed by remember { mutableStateOf(false) }
     var loadingMore by remember { mutableStateOf(false) }
     var noMore by remember { mutableStateOf(false) }
+    // 已上报过已读的最后一条消息 key（null = 本次进入还没报过）。失败不写入 → 下轮重试
+    var lastReadKey by remember(friendId) { mutableStateOf<String?>(null) }
     // 已发出但服务端还没回传的消息（乐观显示），刷新后自动清理
     val pending = remember(friendId) { mutableStateListOf<ChatMessage>() }
     var input by remember { mutableStateOf(TextFieldValue("")) }
@@ -252,6 +289,17 @@ fun ChatScreen(nav: NavHostController, friendId: Long) {
         val serverTexts = h.filter { it.timeMs in (now - 10 * 60_000L)..(now + 60_000L) }
             .map { it.text.trim() }
         pending.removeAll { it.text.trim() in serverTexts }
+        // 先把最新一条的真实消息时间落盘：lastmsg/update 会把服务端 lastMsgTime 改成当前时间，
+        // 列表排序靠这条记录抵消（见 MsgOrderStore）。
+        h.lastOrNull()?.let { MsgOrderStore.record(friendId, it.id, it.timeMs) }
+        // 标记已读：首次进入 + 每出现新消息时上报一次（官方 PrivateMsgDetailActivity 同款
+        // lastmsg/update）。成功后让会话缓存失效 —— 否则返回好友/私信列表时吃的还是旧快照，
+        // 服务端 newMsgCount 已清零、角标却仍挂着。
+        val readKey = h.lastOrNull()?.let { "${it.id}_${it.timeMs}" }.orEmpty()
+        if (lastReadKey != readKey && NcmApi.msgMarkRead(friendId)) {
+            lastReadKey = readKey
+            PageCache.markSessionRead(friendId)
+        }
     }
 
     LaunchedEffect(friendId) {
@@ -272,16 +320,19 @@ fun ChatScreen(nav: NavHostController, friendId: Long) {
     LaunchedEffect(toast) { if (toast != null) { kotlinx.coroutines.delay(1600); toast = null } }
 
     val display = (msgs + pending).sortedBy { it.timeMs }
+    // ★ 2026-10-23 需求①：「发起一起听」改成发**完整分享链接**，链接同时进剪贴板兜底
+    //   （私信接口失败时用户可手动粘贴；见下方 CircleIconButton 的注释）。
+    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
     // 按最后一条消息的身份决定是否跟随滚底：新消息（自己发/对方来）滚底，
     // 加载更早（头部插入，末条不变）不触发 —— 旧版按 size 触发，翻历史会被拉回底部
     val lastMsgKey = display.lastOrNull()?.let { "${it.id}_${it.timeMs}" }
     LaunchedEffect(lastMsgKey) {
-        if (display.isNotEmpty()) listState.animateScrollToItem(display.size) // 末尾有 pad 项
+        if (display.isNotEmpty()) listState.adaptiveAnimateScrollToItem(display.size) // 末尾有 pad 项
     }
 
     // 滚到顶部 → 加载更早（首项为状态占位，消息从索引 1 开始）
     LaunchedEffect(listState, friendId) {
-        snapshotFlow { listState.firstVisibleItemIndex }
+        snapshotFlow { com.netmusiclite.ui.m3e.listFirstIndex(listState) }
             .collect { idx ->
                 if (idx <= 1 && !loadingMore && !noMore && !loading && msgs.isNotEmpty()) {
                     loadingMore = true
@@ -293,8 +344,46 @@ fun ChatScreen(nav: NavHostController, friendId: Long) {
             }
     }
 
+    fun sendMessage() {
+        val text = input.text.trim()
+        if (text.isNotEmpty()) {
+            input = TextFieldValue("")
+            scope.launch {
+                if (NcmApi.msgSend(friendId, text)) {
+                    PageCache.invalidateMsgSessions()
+                    pending.add(ChatMessage(0L, text, System.currentTimeMillis(), true))
+                } else {
+                    toast = "发送失败（私信接口不可用）"
+                    input = TextFieldValue(text) // 回填，别让用户白打一遍
+                }
+            }
+        }
+    }
+
+    // ★ 2026-10-24 需求④：私信里认出的「一起听邀请」→ 点卡片直接进房。
+    //   joiningMsgId 记住是哪一条在进房：卡片半透明 + 文案变「进房中…」，
+    //   并且期间忽略重复点击 —— join 是串行请求，连点三下会撞在第一次的半路上。
+    var joiningMsgId by remember { mutableStateOf(-1L) }
+    fun joinRoom(inv: ChatInvite, msg: ChatMessage) {
+        if (joiningMsgId >= 0L) return
+        if (ListenSession.active) {
+            toast = "已经在一个一起听房间里了，先退出再进这个"
+            return
+        }
+        scope.launch {
+            joiningMsgId = msg.id
+            val ok = runCatching { ListenSession.join(inv.code) }.getOrDefault(false)
+            joiningMsgId = -1L
+            if (ok) nav.navigateWithMotion(Routes.LISTEN_ROOM, NavMotionSpec(NavMotionKind.Pill))
+            else toast = if (ListenSession.statusText.isBlank()) "进房失败" else ListenSession.statusText
+        }
+    }
+
     Box(Modifier.fillMaxSize().background(screenBg()).rotaryList(listState)) {
         // 中间输入框的弧形胶囊底（仅中段：90°±26°）；两端按钮各自独立圆形
+        // ★ 2026-10-18 用户口径「经典主题方表时私信输入框依旧是弯的」：方表不再画弧带，
+        //   改由下方直胶囊 Row 自带胶囊底（见 classic 方表分支）。
+        if (!AppearancePrefs.isM3e && com.netmusiclite.ui.components.isRoundScreen()) {
         androidx.compose.foundation.Canvas(Modifier.fillMaxSize()) {
             val r = 96.dp.toPx()
             drawArc(
@@ -306,11 +395,28 @@ fun ChatScreen(nav: NavHostController, friendId: Long) {
                     34.dp.toPx(), cap = androidx.compose.ui.graphics.StrokeCap.Round),
             )
         }
+        }
 
         Column(Modifier.fillMaxSize()) {
             // 对方名字改为悬浮字（不占列表空间）：在根 Box 顶层渲染，列表直接从顶部起
-            LazyColumn(Modifier.weight(1f), state = listState, horizontalAlignment = Alignment.CenterHorizontally) {
+            // 消息流：m3e 下必须用 SINK 模式（★ 2026-10-24 需求②「消息不允许互相堆叠」）。
+            //   默认 WEAR 会用 transformedHeight **压缩每条的占位高度**，气泡实际内容比槽位高
+            //   就溢出、压到邻居 = 用户看到的「堆叠」；和评论区 2026-10-17 那次是同一个根因
+            //   （见 CommentsScreen 的 mode = M3eListMode.SINK）。SINK = 占真实高度 +
+            //   下沉由气泡整行挂 m3eSinkFromCenter()。经典主题忽略此参数。
+            LazyColumn(
+                Modifier.weight(1f),
+                state = listState,
+                horizontalAlignment = Alignment.CenterHorizontally,
+                mode = com.netmusiclite.ui.m3e.M3eListMode.SINK,
+            ) {
                 item(key = "head") {
+                    if (AppearancePrefs.isM3e) {
+                        androidx.wear.compose.material3.ListHeader(Modifier.fillMaxWidth(),
+                            transformation = com.netmusiclite.ui.m3e.LocalItemTransformation.current) {
+                            androidx.wear.compose.material3.Text(friend?.name ?: "私信")
+                        }
+                    }
                     Text(
                         when {
                             loading -> "加载中…"
@@ -325,7 +431,17 @@ fun ChatScreen(nav: NavHostController, friendId: Long) {
                         textAlign = TextAlign.Center,
                     )
                 }
-                itemsIndexedMessages(display, friend?.avatarUrl) { s ->
+                itemsIndexedMessages(
+                    display, friend?.avatarUrl,
+                    // ★ 2026-10-22 用户口径⑤：m3e 私信点对方头像进好友主页 ——
+                    //   与好友列表 M3eContactRow 的 onProfile 走同一条路由（Routes.userPage）。
+                    //   经典主题不使用（该分支的头像保持原样，不在本次需求范围）。
+                    onProfile = { nav.navigateWithMotion(Routes.userPage(friendId)) },
+                    // ★ 2026-10-24 需求④：邀请卡的副标题要知道「谁发的」
+                    peerName = friend?.name ?: "对方",
+                    joiningId = joiningMsgId,
+                    onJoin = { inv, m -> joinRoom(inv, m) },
+                ) { s ->
                     if (s.title.isNotEmpty()) {
                         PlayerEngine.playOne(s)
                         nav.navigateWithMotion(Routes.PLAYER, NavMotionSpec(NavMotionKind.Pill))
@@ -348,7 +464,7 @@ fun ChatScreen(nav: NavHostController, friendId: Long) {
         }
 
         // 对方名字：悬浮字（叠加在消息列表上方，不占布局空间），较原位置上移 30px（=15dp@2.0）
-        Text(
+        if (!AppearancePrefs.isM3e) Text(
             friend?.name ?: "私信",
             fontSize = 10.sp, fontWeight = FontWeight.Bold, color = TextPrimary,
             textAlign = TextAlign.Center,
@@ -371,10 +487,29 @@ fun ChatScreen(nav: NavHostController, friendId: Long) {
                     menuOpen = false
                     scope.launch {
                         if (ListenSession.create()) {
-                            val rid = ListenSession.roomId ?: "-"
-                            val ok = NcmApi.msgSend(friendId, "我在 NetMusicLite 开了个一起听，房间号 $rid，来一起听")
-                            if (ok) PageCache.invalidateMsgSessions()
-                            toast = if (ok) "邀请已发送" else "房间已建（$rid），但邀请发送失败"
+                            // ★ 2026-10-23 需求①（用户口径「私信里一起听分享发出去的是房间号，不是完整链接」）：
+                            //   改成发 **完整分享链接**（shareLink() = https://st.music.163.com/listen-together/
+                            //   share/?songId=..&roomId=..&inviterId=..）：对方在私信里点一下就能进房/在官方
+                            //   App 打开，一串裸房号是没法点的。
+                            //   ⚠ shareLink() 需要**服务端确认的房号**，未就绪时返回 null —— 这时只提示「未就绪」，
+                            //   **绝不退回发房间号**（旧实现就是这里把裸房号发了出去，还会出现「房间号 -」的假房号）。
+                            //   链接同时进剪贴板：私信接口抽风时用户还能手动粘贴，不至于白建一个房。
+                            val link = ListenSession.shareLink()
+                            if (link == null) {
+                                toast = "房间信息未就绪，请稍后重试"
+                            } else {
+                                clipboard.setText(AnnotatedString(link))
+                                val ok = NcmApi.msgSend(
+                                    friendId,
+                                    "我在 NetMusicLite 开了个一起听，点链接一起听：$link",
+                                )
+                                if (ok) {
+                                    PageCache.invalidateMsgSessions()
+                                    toast = "邀请已发送（链接已复制）"
+                                } else {
+                                    toast = "私信发送失败 · 邀请链接已复制"
+                                }
+                            }
                         } else toast = ListenSession.statusText
                     }
                 }, size = 40.dp, iconSize = 18.dp, container = Accent)
@@ -406,6 +541,62 @@ fun ChatScreen(nav: NavHostController, friendId: Long) {
         }
 
         // 弧形胶囊上的三个元素：+(最左) / 输入框(中) / 发送(右)
+        if (AppearancePrefs.isM3e) {
+            // ★ 2026-10-18 用户口径「m3e 私信在圆表下聊天框要呈圆弧胶囊状」：
+            //   圆表走 M3eChatComposerArc（贴着表盘弧线的一整条），方表仍用直胶囊。
+            if (com.netmusiclite.ui.components.isRoundScreen()) {
+                com.netmusiclite.ui.m3e.M3eChatComposerArc(
+                    input, { input = it }, menuOpen, { menuOpen = !menuOpen }, { sendMessage() },
+                    Modifier.fillMaxSize(),
+                )
+            } else {
+                com.netmusiclite.ui.m3e.M3eChatComposer(
+                    input, { input = it }, menuOpen, { menuOpen = !menuOpen }, { sendMessage() },
+                    Modifier.align(Alignment.BottomCenter).padding(bottom = 20.dp),
+                )
+            }
+        } else if (!com.netmusiclite.ui.components.isRoundScreen()) {
+            // ★ 2026-10-18 用户口径「经典主题私信界面选择方表的时候聊天输入框依旧是弯的
+            //   而不是直的」：方表没有圆弧边缘可贴，弧形布局在这里只会显得歪 ——
+            //   改成一条水平直胶囊（+ / 输入框 / 发送 三等分），底边距屏底 8dp。
+            Row(
+                Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 8.dp)
+                    .width(186.dp)
+                    .height(38.dp)
+                    .clip(RoundedCornerShape(50))
+                    .background(Color.White.copy(alpha = 0.10f))
+                    .padding(horizontal = 3.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                CircleIconButton(
+                    if (menuOpen) NcmIcons.Close else NcmIcons.Plus, "更多",
+                    { menuOpen = !menuOpen },
+                    size = 32.dp, iconSize = 14.dp,
+                )
+                BasicTextField(
+                    value = input,
+                    onValueChange = { input = it },
+                    singleLine = true,
+                    textStyle = TextStyle(fontSize = 11.sp, color = TextPrimary),
+                    cursorBrush = SolidColor(Accent),
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(horizontal = 4.dp, vertical = 7.dp),
+                    // ★ 2026-10-23 需求③（用户口径「所有文字输入框里的占位文字全部删除，只留空白框」）：
+                    //   删掉框内「说点什么…」占位，只保留 inner()。空文本仍按 textStyle 占一行行高，
+                    //   外层胶囊 Row 有 height(38.dp) 兜底 ⇒ 不会塌陷。
+                    decorationBox = { inner -> Box(Modifier.fillMaxWidth()) { inner() } },
+                )
+                CircleIconButton(
+                    NcmIcons.Send, "发送",
+                    { sendMessage() },
+                    size = 32.dp, iconSize = 14.dp,
+                    tint = Accent,
+                )
+            }
+        } else
         BoxWithConstraints(Modifier.fillMaxSize()) {
             val cx = maxWidth / 2
             val cyc = maxHeight / 2
@@ -427,21 +618,7 @@ fun ChatScreen(nav: NavHostController, friendId: Long) {
             val ry = cyc + rB * kotlin.math.cos(radR).toFloat()
             CircleIconButton(
                 NcmIcons.Send, "发送",
-                {
-                    val text = input.text.trim()
-                    if (text.isNotEmpty()) {
-                        input = TextFieldValue("")
-                        scope.launch {
-                            if (NcmApi.msgSend(friendId, text)) {
-                                PageCache.invalidateMsgSessions()
-                                pending.add(ChatMessage(0L, text, System.currentTimeMillis(), true))
-                            } else {
-                                toast = "发送失败（私信接口不可用）"
-                                input = TextFieldValue(text) // 回填，别让用户白打一遍
-                            }
-                        }
-                    }
-                },
+                { sendMessage() },
                 modifier = Modifier.offset {
                     androidx.compose.ui.unit.IntOffset(
                         (rx - 16.dp).roundToPx(), (ry - 16.dp).roundToPx())
@@ -462,11 +639,10 @@ fun ChatScreen(nav: NavHostController, friendId: Long) {
                     .clip(RoundedCornerShape(50))
                     .clickable(enabled = false) {}
                     .padding(horizontal = 4.dp, vertical = 7.dp),
+                // ★ 2026-10-23 需求③：删除框内「说点什么…」占位（只留空白框）。
+                //   圆表这条输入框靠 bottom padding + 弧带定位，高度由一行行高撑住，不会塌陷。
                 decorationBox = { inner ->
-                    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-                        if (input.text.isEmpty()) Text("说点什么…", fontSize = 10.sp, color = TextSecondary)
-                        inner()
-                    }
+                    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) { inner() }
                 },
             )
         }
@@ -489,10 +665,26 @@ private fun songIdFromText(t: String): Long =
  * 消息流：己方右对齐主色气泡，对方左对齐玻璃气泡（左侧带对方小头像，两边分布一眼可辨）；
  * 间隔超过 10 分钟插一条时间行。歌曲消息渲染成**可点卡片**（封面 + 歌名艺人，点击即播），
  * 文本消息里若含单曲链接也可点。乐观追加的未确认消息（id=0）半透明显示 = 发送中。
+ *
+ * ★ 2026-10-24 两条新口径：
+ * ③ **长按任意气泡 = 复制**（[copyOnLongPress]，两主题都做）：弹「复制全文 / 选文字」面板；
+ * ④ **一起听邀请自动成卡**（[listenInviteOf]）：正文里认出分享链接/房号时，
+ *    不再显示那串几百字符的 URL，改画 [com.netmusiclite.ui.components.ListenInviteCard]，
+ *    点卡片直接 `ListenSession.join()` 进房，卡下面留一行截断短链。
  */
 private fun androidx.compose.foundation.lazy.LazyListScope.itemsIndexedMessages(
     display: List<ChatMessage>,
     friendAvatar: String?,
+    /**
+     * 点对方头像 → 好友主页。null = 头像不可点（经典主题 / 其它调用方）。
+     * ★ 2026-10-22 放第三个参数（onOpenSong 之前）以便调用方继续用尾随 lambda 传 onOpenSong。
+     */
+    onProfile: (() -> Unit)? = null,
+    /** 邀请卡副标题里的发言人昵称（★ 2026-10-24 需求④） */
+    peerName: String = "对方",
+    /** 正在进房的那条消息 id（-1 = 没有）；同一条卡片显示「进房中…」并忽略重复点击 */
+    joiningId: Long = -1L,
+    onJoin: (ChatInvite, ChatMessage) -> Unit = { _, _ -> },
     onOpenSong: (Song) -> Unit,
 ) {
     items(display.size, key = { i -> "${display[i].id}_$i" }) { i ->
@@ -515,6 +707,26 @@ private fun androidx.compose.foundation.lazy.LazyListScope.itemsIndexedMessages(
         val onBubble = if (msg.fromMe) OnAccent else TextPrimary
         val onBubbleSub = if (msg.fromMe) OnAccent.copy(alpha = 0.72f) else TextSecondary
         val song = msg.song
+        // ★ 2026-10-18 m3e 私信「同一人连续多条消息合并」：
+        //   组首 = 上一条不存在 / 换了发言人 / 间隔超过 5 分钟（与上面的 10 分钟时间行分开）。
+        //   头像只画在组首那条上，30dp、与气泡顶部对齐（口径见 M3eChatMessage 的 KDoc）。
+        //   间距本身不再区分组内/组间（2026-10-24 需求②：每条上下各 5dp、左右 10dp），
+        //   合并只体现在「共用头像」这一点上。
+        val groupHead = prev == null || prev.fromMe != msg.fromMe ||
+            msg.timeMs - prev.timeMs > 5 * 60_000L
+        // 歌曲卡片优先：同一条消息里既有歌又有链接时，卡片本来就是可点的，不再叠邀请卡。
+        // 官方 App 的邀请是 bodyType=23 的卡片（非链接）：房号由 [NcmApi.msgHistory] 预先
+        // 解析进 msg.invite，正文里没有 URL，所以先看结构化字段，再退回正文识别。
+        val invite = msg.invite ?: if (song == null) listenInviteOf(msg.text) else null
+        val inviteSub = if (msg.fromMe) "我发起的一起听 · 点卡片进房"
+            else "$peerName 邀请你 · 点卡片进房"
+        if (AppearancePrefs.isM3e) {
+            M3eChatMessage(
+                msg, friendAvatar, songIdFromText(msg.text), onOpenSong, groupHead, onProfile,
+                invite, joiningId == msg.id, { invite?.let { onJoin(it, msg) } }, inviteSub,
+            )
+            return@items
+        }
         // 头像只挂在对方一侧；自己侧留等宽空白，两侧气泡不对齐到屏幕边缘
         Row(
             Modifier.fillMaxWidth().padding(vertical = 3.dp, horizontal = 10.dp),
@@ -525,15 +737,25 @@ private fun androidx.compose.foundation.lazy.LazyListScope.itemsIndexedMessages(
                 Spacer(Modifier.width(6.dp))
             }
             Box(Modifier.weight(1f).graphicsLayer { this.alpha = alpha }, contentAlignment = align) {
-                if (song != null) {
-                    // 歌曲卡片：点击直接播放
+                if (invite != null) {
+                    // ★ 2026-10-24 需求④：一起听邀请 → 可点卡片 + 一行短链（长按复制原文）
+                    Column(horizontalAlignment = if (msg.fromMe) Alignment.End else Alignment.Start) {
+                        ListenInviteCard(
+                            subtitle = inviteSub,
+                            busy = joiningId == msg.id,
+                            onJoin = { onJoin(invite, msg) },
+                            onCopyText = msg.text,
+                        )
+                        InviteCaption(inviteCaption(invite.code), msg.text)
+                    }
+                } else if (song != null) {
+                    // 歌曲卡片：点击直接播放，长按复制（★ 需求③）
                     Row(
                         Modifier
                             .clip(RoundedCornerShape(12.dp))
                             .background(bubble)
-                            .clickable(
-                                interactionSource = remember { MutableInteractionSource() },
-                                indication = null,
+                            .copyOnLongPress(
+                                msg.text.ifEmpty { "${song.title} - ${song.artist}" },
                             ) { onOpenSong(song) }
                             .padding(6.dp),
                         verticalAlignment = Alignment.CenterVertically,
@@ -558,11 +780,11 @@ private fun androidx.compose.foundation.lazy.LazyListScope.itemsIndexedMessages(
                         modifier = Modifier
                             .clip(RoundedCornerShape(12.dp))
                             .background(bubble)
-                            .clickable(
-                                enabled = linkId > 0L,
-                                interactionSource = remember { MutableInteractionSource() },
-                                indication = null,
-                            ) { if (linkId > 0L) onOpenSong(Song(linkId, "", "", 0L, "", 0L, 0, null)) }
+                            // 单击=打开歌链接（有才生效），长按=复制面板（★ 需求③）。
+                            // 合成同一个 combinedClickable，不另起 pointerInput 层。
+                            .copyOnLongPress(msg.text) {
+                                if (linkId > 0L) onOpenSong(Song(linkId, "", "", 0L, "", 0L, 0, null))
+                            }
                             .padding(horizontal = 10.dp, vertical = 6.dp),
                     )
                 }

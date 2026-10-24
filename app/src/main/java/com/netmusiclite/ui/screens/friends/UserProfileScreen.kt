@@ -24,6 +24,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.navigation.NavHostController
 import com.netmusiclite.data.NcmApi
+import com.netmusiclite.data.AppearancePrefs
 import com.netmusiclite.data.PlaylistItem
 import com.netmusiclite.data.UserDetail
 import com.netmusiclite.ui.components.CenterHint
@@ -35,6 +36,9 @@ import com.netmusiclite.ui.nav.NavMotionKind
 import com.netmusiclite.ui.nav.navigateWithMotion
 import com.netmusiclite.ui.theme.TextPrimary
 import com.netmusiclite.ui.theme.TextSecondary
+import com.netmusiclite.ui.m3e.M3eCollectionCard
+import com.netmusiclite.ui.m3e.M3eContactRow
+import com.netmusiclite.ui.m3e.M3eList
 
 /** 他人主页：头像昵称 + 累计听歌 + Ta 的公开歌单，点歌单进歌单详情 */
 @Composable
@@ -47,6 +51,25 @@ fun UserProfileScreen(nav: NavHostController, uid: Long) {
         detail = runCatching { NcmApi.userDetail(uid) }.getOrNull()
         playlists = runCatching { NcmApi.userPlaylists(uid) }.getOrDefault(emptyList())
         loading = false
+    }
+
+    if (AppearancePrefs.isM3e) {
+        M3eList(title = detail?.nickname ?: "用户主页") {
+            item(key = "header") {
+                M3eContactRow(detail?.nickname ?: if (loading) "加载中…" else "用户主页", detail?.avatarUrl,
+                    detail?.let { "累计听歌 ${it.listenSongs} 首 · Lv.${it.level}" }, null, {})
+            }
+            if (!loading && playlists.isEmpty()) item(key = "empty") {
+                androidx.wear.compose.material3.Text("没有可见的歌单",
+                    style = androidx.wear.compose.material3.MaterialTheme.typography.bodyMedium)
+            }
+            itemsIndexed(playlists, key = { _, playlist -> playlist.id }, contentType = { _, _ -> "playlist" }) { _, playlist ->
+                M3eCollectionCard(playlist.name, "${playlist.trackCount} 首歌曲", playlist.coverUrl) {
+                    nav.navigateWithMotion(Routes.playlistDetail(playlist.id))
+                }
+            }
+        }
+        return
     }
 
     StackedCardList(

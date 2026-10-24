@@ -14,7 +14,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
+import com.netmusiclite.ui.m3e.AdaptiveLazyColumn as LazyColumn
+import com.netmusiclite.ui.m3e.M3eListMode
+import com.netmusiclite.ui.m3e.m3eSinkFromCenter
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
@@ -86,6 +88,17 @@ fun CommentsScreen(nav: NavHostController, songId: Long) {
     var expandedId by remember { mutableStateOf<Long?>(null) }
     val repliesMap = remember { mutableStateMapOf<Long, List<CommentItem>>() }
     var replyLoading by remember { mutableStateOf(false) }
+    // ★ 2026-10-18 楼中楼分页（用户口径「回复评论的评论限制十条加载」）：
+    //   floor/get 一页只有 10~20 条，旧实现只拉第一页、也不认 hasMore，
+    //   于是回复列表永远停在一页。这里按主楼 id 记录三样状态：
+    //   · replyHasMore —— 服务端说还有下一页（data.hasMore）
+    //   · replyCursor  —— 下一页游标（data.time，回传给 commentReplies 的 time）
+    //   · replyMoreLoadingId —— 正在给哪条主楼加载下一页（同一时刻只允许一个，避免连点）
+    val replyHasMore = remember { mutableStateMapOf<Long, Boolean>() }
+    val replyCursor = remember { mutableStateMapOf<Long, Long>() }
+    var replyMoreLoadingId by remember { mutableStateOf<Long?>(null) }
+    /** 楼中楼一页的条数：与服务端上限对齐（手机端默认也是 10），后续「加载更多」按同一页大小翻 */
+    val replyPageSize = 10
 
     // ★ 2026-10-01 六轮（用户口径「评论区回复数量要主动显示」）：
     //   主评论列表接口不下发 replyCount（实测三种口径都没有），条数只能靠 floor/get 逐条问。
@@ -197,8 +210,15 @@ fun CommentsScreen(nav: NavHostController, songId: Long) {
         replyLoading = true
         scope.launch {
             try {
-                val r = runCatching { NcmApi.commentReplies(threadId, c.id) }.getOrNull()
+                // ★ 2026-10-18：按楼中楼一页大小拉第一页，并把 hasMore / 下一页游标记下来，
+                //   供下面「加载更多回复」继续翻页（旧实现只拉第一页、状态全丢，
+                //   所以回复永远停在一页 —— 用户口径「回复评论的评论限制十条加载」）。
+                val r = runCatching {
+                    NcmApi.commentReplies(threadId, c.id, limit = replyPageSize)
+                }.getOrNull()
                 repliesMap[c.id] = r?.items ?: emptyList()
+                replyHasMore[c.id] = r?.hasMore == true
+                replyCursor[c.id] = r?.nextTime ?: 0L
                 // 主评论列表不下发楼层数（实测），拿 floor/get 的真实 totalCount 回填主楼，
                 // 之后入口就显示准确条数而不是笼统的「回复」
                 val total = r?.total ?: 0
@@ -218,9 +238,45 @@ fun CommentsScreen(nav: NavHostController, songId: Long) {
         }
     }
 
+    /**
+     * 楼中楼「加载更多回复」：按第一页带回来的 `data.time` 游标翻下一页，追加到已展开的列表。
+     * 失败时**保留 hasMore**（用户还能再点一次重试），不假装「到底了」。
+     */
+    fun loadMoreReplies(c: CommentItem) {
+        if (c.id <= 0L) return
+        if (replyMoreLoadingId != null) return          // 同一时刻只翻一个楼，连点会被忽略
+        if (replyHasMore[c.id] != true) return
+        val cursor = replyCursor[c.id] ?: 0L
+        replyMoreLoadingId = c.id
+        scope.launch {
+            try {
+                val r = runCatching {
+                    NcmApi.commentReplies(threadId, c.id, limit = replyPageSize, time = cursor)
+                }.getOrNull()
+                if (r != null) {
+                    val merged = (repliesMap[c.id].orEmpty() + r.items).distinctBy { it.id }
+                    repliesMap[c.id] = merged
+                    replyHasMore[c.id] = r.hasMore
+                    replyCursor[c.id] = r.nextTime
+                    val total = r.total
+                    if (total > 0) {
+                        replyCounts[c.id] = total
+                        fun patch(list: List<CommentItem>) = list.map {
+                            if (it.id == c.id) it.copy(replyCount = total) else it
+                        }
+                        hot = patch(hot)
+                        latest = patch(latest)
+                    }
+                }
+            } finally {
+                replyMoreLoadingId = null
+            }
+        }
+    }
+
     val endVisible by remember {
         derivedStateOf {
-            val info = listState.layoutInfo
+            val info = com.netmusiclite.ui.m3e.listLayoutInfo(listState)
             info.totalItemsCount > 0 &&
                 (info.visibleItemsInfo.lastOrNull()?.index ?: -1) >= info.totalItemsCount - 2
         }
@@ -254,6 +310,11 @@ fun CommentsScreen(nav: NavHostController, songId: Long) {
             state = listState,
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(top = 46.dp, bottom = 10.dp),
+            // ★ 2026-10-17 用户口径「m3e 主题下评论区禁用堆叠效果，只允许出现下沉效果」：
+            //   SINK = 不再用 Wear 的 transformedHeight 压缩评论行占位高度（压缩后长评论溢出、
+            //   相邻条目互相叠 = 「堆叠」），也不给 Material 组件形变；改为逐项按距屏幕中线
+            //   缩放 + 变暗的下沉效果（参数与经典主题 sinkFromCenter 同源，见 M3eShared）。
+            mode = M3eListMode.SINK,
         ) {
             if (loading) {
                 item { CenterHint("加载中…", Modifier.fillMaxWidth().height(160.dp)) }
@@ -273,6 +334,9 @@ fun CommentsScreen(nav: NavHostController, songId: Long) {
                             replies = repliesMap[c.id].orEmpty(),
                             replyLoading = replyLoading && expandedId == c.id,
                             replyCount = maxOf(replyCounts[c.id] ?: 0, c.replyCount),
+                            replyHasMore = replyHasMore[c.id] == true,
+                            replyMoreLoading = replyMoreLoadingId == c.id,
+                            onLoadMoreReplies = { loadMoreReplies(c) },
                             onLike = { toggleLike(c, true) },
                             onToggleReplies = { toggleReplies(c) },
                             onReplyLike = { r -> toggleReplyLike(c.id, r) },
@@ -291,6 +355,9 @@ fun CommentsScreen(nav: NavHostController, songId: Long) {
                         replies = repliesMap[c.id].orEmpty(),
                         replyLoading = replyLoading && expandedId == c.id,
                         replyCount = maxOf(replyCounts[c.id] ?: 0, c.replyCount),
+                        replyHasMore = replyHasMore[c.id] == true,
+                        replyMoreLoading = replyMoreLoadingId == c.id,
+                        onLoadMoreReplies = { loadMoreReplies(c) },
                         onLike = { toggleLike(c, false) },
                         onToggleReplies = { toggleReplies(c) },
                         onReplyLike = { r -> toggleReplyLike(c.id, r) },
@@ -337,11 +404,37 @@ private fun CommentRow(
     replyLoading: Boolean,
     /** 主动补齐后的回复数（floor/get 逐条问回来的），接口没下发时由调用方兜底 */
     replyCount: Int,
+    /** 该主楼还有下一页回复（floor/get 的 data.hasMore） */
+    replyHasMore: Boolean,
+    /** 该主楼正在加载下一页回复 */
+    replyMoreLoading: Boolean,
+    onLoadMoreReplies: () -> Unit,
     onLike: () -> Unit,
     onToggleReplies: () -> Unit,
     onReplyLike: (CommentItem) -> Unit,
 ) {
-    Column(Modifier.fillMaxWidth().padding(horizontal = 22.dp, vertical = 5.dp)) {
+    // ★ 2026-10-17 用户口径「m3e 主题下评论区禁用堆叠、只允许下沉」：
+    //   堆叠（Wear transforming 列表的 transformedHeight 高度压缩）已在列表层关掉（mode = SINK）；
+    //   下沉在这里声明 —— 只作用于评论正文条目（SectionLabel / 加载提示 / footer 保持原样），
+    //   按距屏幕竖直中线的距离缩放 + 变暗，参数与经典主题 sinkFromCenter 同源。经典主题下是空操作。
+    //
+    // ★ 2026-10-23 修「点『N 条回复 / 展开更多回复』后，二级菜单自己跟着下沉」：
+    //   m3eSinkFromCenter 的基准是**自身高度的一半**（M3eShared：centerY = item 顶部 + height/2，
+    //   再与 STACKED_VIEWPORT/2 = 116.5dp 的屏幕中线比较）。它只为「一屏一行的卡片」设计：
+    //   高度 ~60-90dp 时 item 近似贴着中线滑过，缩放/变暗轻微且连续。
+    //   而二级回复是**就地展开在本 item 内部**的（不是独立的 LazyColumn item），展开后本行高度
+    //   会涨到 300dp 以上、常常超过整个 233dp 视口 ⇒ 自身中心长期远离屏幕中线、t 值一直很大：
+    //   整块（主评论 + 二级回复）被持续压在 ≈0.88 缩放 / 0.64 alpha；滑动时中心又连续移动
+    //   ⇒ 用户看到的就是「二级菜单自己在做下沉动画」，且回复展开得越多、块越高，下沉越重
+    //   （越滑越糊）。这就是「二级菜单被当成独立形变单元」的实际成因。
+    //   用户口径：二级回复与主评论属**同一层级**，在该层级内滑动不触发下沉动画。
+    //   做法：**展开态不挂下沉** —— 这一条变成静态层级，主评论与二级回复作为同一块平滑滚动、
+    //   不缩放不变暗；收起态维持原逻辑（单行高度，按设计下沉）。
+    //   二级回复仍留在同一个 LazyColumn item 内（同一层级），不拆 item、不动 key/contentType，
+    //   所以回复翻页 / 加载更多 / 点赞 / 回复交互与经典主题观感都不受影响
+    //   （经典主题下 m3eSinkFromCenter 本就是空操作）。
+    val rowSink = if (expanded) Modifier else Modifier.m3eSinkFromCenter()
+    Column(Modifier.fillMaxWidth().then(rowSink).padding(horizontal = 22.dp, vertical = 5.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             CoverImage(c.avatar, 20.dp, shape = CircleShape)
             Spacer(Modifier.width(6.dp))
@@ -439,6 +532,29 @@ private fun CommentRow(
                 )
                 else -> Column(Modifier.padding(start = 12.dp, top = 1.dp)) {
                     replies.forEach { r -> ReplyRow(r) { onReplyLike(r) } }
+                    // ★ 2026-10-18：楼中楼分页入口（用户口径「回复评论的评论限制十条加载」）。
+                    //   floor/get 一页只有 10~20 条，旧实现拉完第一页就没有下文；现在只要服务端
+                    //   说还有下一页（data.hasMore），就在回复列表末尾给一条明确的「加载更多回复」，
+                    //   点一下按 data.time 游标继续翻页（详见 loadMoreReplies）。
+                    if (replyHasMore) {
+                        Text(
+                            if (replyMoreLoading) "加载中…"
+                            else "加载更多回复" +
+                                (replyCount - replies.size).takeIf { it > 0 }?.let { "（还有 $it 条）" }.orEmpty(),
+                            fontSize = 9.sp, color = Accent,
+                            modifier = Modifier
+                                .padding(start = 14.dp, top = 5.dp)
+                                .clip(RoundedCornerShape(50))
+                                .background(Accent.copy(alpha = 0.10f))
+                                .clickable(
+                                    interactionSource = remember { MutableInteractionSource() },
+                                    indication = null,
+                                    enabled = !replyMoreLoading,
+                                    onClick = onLoadMoreReplies,
+                                )
+                                .padding(horizontal = 9.dp, vertical = 3.dp),
+                        )
+                    }
                 }
             }
         }

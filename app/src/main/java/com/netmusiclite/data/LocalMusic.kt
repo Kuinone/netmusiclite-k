@@ -11,6 +11,22 @@ import kotlinx.coroutines.withContext
 object LocalMusic {
 
     suspend fun scan(ctx: Context): List<Song> = withContext(Dispatchers.IO) {
+        val out = queryMediaStore(ctx)
+        // 合并「手动导入 → 应用内下载 → 媒体库扫描」三层；导入/下载的重复项不显示媒体库版本。
+        // ★ 2026-10-03 导入的歌曲只在这里合并进列表 —— 不写任何歌单/红心存储，
+        //   因此「我喜欢」等页面天然看不到导入条目（用户口径「只在本地音乐内生效」）。
+        val imported = ImportStore.list(ctx)
+        val downloaded = DownloadStore.allDownloaded()
+            .filter { d -> out.none { it.title == d.title && it.artist == d.artist } }
+        (imported + downloaded + out).distinctBy { it.title + it.artist }
+    }
+
+    /** 仅设备媒体库扫描（不含导入/下载合并）—— 「导入本地音乐」页据此过滤出可导入项 */
+    suspend fun scanDevice(ctx: Context): List<Song> = withContext(Dispatchers.IO) {
+        queryMediaStore(ctx)
+    }
+
+    private fun queryMediaStore(ctx: Context): MutableList<Song> {
         val out = mutableListOf<Song>()
         val collection: Uri = if (android.os.Build.VERSION.SDK_INT >= 29)
             MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
@@ -50,10 +66,7 @@ object LocalMusic {
                 }
             }
         }
-        // 合并应用内下载（保留线上 id，可跳艺人/专辑）
-        val downloaded = DownloadStore.allDownloaded()
-            .filter { d -> out.none { it.title == d.title && it.artist == d.artist } }
-        (downloaded + out).distinctBy { it.title + it.artist }
+        return out
     }
 
     /** coverUrl 形如 local://<uri> 时取回 uri */

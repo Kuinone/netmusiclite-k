@@ -14,7 +14,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
+import com.netmusiclite.ui.m3e.AdaptiveLazyColumn as LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -43,7 +43,6 @@ import com.netmusiclite.data.PlayerEngine
 import com.netmusiclite.data.SessionStore
 import com.netmusiclite.data.SleepMode
 import com.netmusiclite.data.SleepTimer
-import com.netmusiclite.ui.components.CircleIconButton
 import com.netmusiclite.ui.components.NcmIcons
 import com.netmusiclite.ui.components.StackedCardList
 import com.netmusiclite.ui.components.StackedSongCard
@@ -54,6 +53,7 @@ import com.netmusiclite.ui.theme.Accent
 import com.netmusiclite.ui.theme.screenBg
 import com.netmusiclite.ui.theme.SurfaceGlass
 import com.netmusiclite.ui.theme.TextPrimary
+import com.netmusiclite.ui.theme.PlayTextSecondary
 import com.netmusiclite.ui.theme.TextSecondary
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -64,6 +64,10 @@ import kotlinx.coroutines.launch
 
 @Composable
 fun SleepTimerScreen(nav: NavHostController) {
+    if (com.netmusiclite.data.AppearancePrefs.isM3e) {
+        com.netmusiclite.ui.m3e.M3eSleepTimer()
+        return
+    }
     val current = SleepTimer.mode
     StackedCardList(title = "睡眠定时", progressTotal = SleepMode.entries.size) {
         itemsIndexed(SleepMode.entries, key = { _, m -> m.name }, contentType = { _, _ -> "sleep" }) { _, m ->
@@ -108,7 +112,8 @@ fun SleepCountdownLabel(
         }
     }
     if (text.isNotEmpty()) {
-        Text(text, fontSize = fontSize, color = TextSecondary, modifier = modifier)
+        // 播放组作用域内跟随明暗对调（作用域外 = 原 TextSecondary）
+        Text(text, fontSize = fontSize, color = PlayTextSecondary, modifier = modifier)
     }
 }
 
@@ -116,6 +121,10 @@ fun SleepCountdownLabel(
 
 @Composable
 fun QueueScreen(nav: NavHostController) {
+    if (com.netmusiclite.data.AppearancePrefs.isM3e) {
+        com.netmusiclite.ui.m3e.M3eQueue(nav)
+        return
+    }
     val queue = PlayerEngine.queue
     val currentId = PlayerEngine.current?.id
     StackedCardList(title = "列表播放", progressTotal = queue.size, cardHeight = 56.dp) {
@@ -138,26 +147,46 @@ fun QueueScreen(nav: NavHostController) {
     }
 }
 
-// ================= 收藏到歌单（新建 + 列表 + ×） =================
+// ================= 收藏到歌单（新建 + 列表） =================
 
+/**
+ * 收藏到歌单。
+ *
+ * ★ 2026-10-10 版式（用户要求）：标题「收藏到歌单」顶到屏幕顶端，**去掉底部的 × 退出键**，
+ *   余下整屏全部让给歌单列表（列表 weight(1f) 撑满）。退出方式 = 全局右滑返回
+ *   （路由挂在 `backable {}` 上，见 AppNav）。
+ *   顶部仍留 6dp 而非 0dp：圆屏最上一行只有几个像素宽，0 留白会把标题的字头切掉。
+ */
 @Composable
 fun CollectScreen(nav: NavHostController) {
+    if (com.netmusiclite.data.AppearancePrefs.isM3e) {
+        com.netmusiclite.ui.m3e.M3eCollect()
+        return
+    }
     var playlists by remember { mutableStateOf<List<com.netmusiclite.data.PlaylistItem>>(emptyList()) }
+    var loaded by remember { mutableStateOf(false) }
     var showCreate by remember { mutableStateOf(false) }
     var toast by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
 
     LaunchedEffect(Unit) {
-        playlists = PageCache.userPlaylists(SessionStore.uid).filter { it.isMine }
+        // 「我喜欢的音乐」是 specialType==5 的特殊歌单：不能作为普通歌单增删曲目，
+        // 列进去只会让用户点到「收藏失败」，官方客户端也不把它放进收藏目标列表。
+        playlists = PageCache.userPlaylists(SessionStore.uid)
+            .filter { it.isMine && it.specialType != 5 }
+        loaded = true
     }
     LaunchedEffect(toast) { if (toast != null) { delay(1800); toast = null } }
 
     Box(Modifier.fillMaxSize().background(screenBg()).rotaryList(listState)) {
         Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
-            Spacer(Modifier.height(48.dp))
-            Text("收藏到歌单", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
-            Spacer(Modifier.height(10.dp))
+            Text(
+                "收藏到歌单",
+                fontSize = 13.sp, fontWeight = FontWeight.Bold, color = TextPrimary,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+            Spacer(Modifier.height(6.dp))
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
@@ -173,8 +202,19 @@ fun CollectScreen(nav: NavHostController) {
                 Spacer(Modifier.width(8.dp))
                 Text("新建歌单", fontSize = 11.sp, color = TextPrimary)
             }
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(6.dp))
+            // 余下整屏都给歌单
             LazyColumn(Modifier.weight(1f), state = listState, horizontalAlignment = Alignment.CenterHorizontally) {
+                if (loaded && playlists.isEmpty()) {
+                    item(key = "empty") {
+                        Text(
+                            "还没有歌单\n点上方「新建歌单」创建一个",
+                            fontSize = 10.sp, color = TextSecondary, lineHeight = 15.sp,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.fillMaxWidth().padding(top = 40.dp),
+                        )
+                    }
+                }
                 itemsIndexed(playlists, key = { _, p -> p.id }, contentType = { _, _ -> "playlist" }) { _, pl ->
                     Text(
                         pl.name,
@@ -189,9 +229,19 @@ fun CollectScreen(nav: NavHostController) {
                                 if (sid == null) {
                                     toast = "没有正在播放的歌曲"
                                 } else scope.launch {
-                                    val ok = NcmApi.addToPlaylist(pl.id, sid)
-                                    if (ok) { PageCache.invalidatePlaylistDetail(pl.id); PageCache.invalidatePlaylists() }
-                                    toast = if (ok) "已收藏到「${pl.name}」" else "收藏失败"
+                                    // ★ 2026-10-18：与 m3e 版同一口径 —— 服务端对「歌已在
+                                    //   歌单里」回 502（歌单内歌曲重复），不是失败；按
+                                    //   PlaylistEditOutcome 分档提示，别再报「收藏失败」。
+                                    val outcome = NcmApi.addToPlaylist(pl.id, sid)
+                                    if (outcome != NcmApi.PlaylistEditOutcome.FAILED) {
+                                        PageCache.invalidatePlaylistDetail(pl.id)
+                                        PageCache.invalidatePlaylists()
+                                    }
+                                    toast = when (outcome) {
+                                        NcmApi.PlaylistEditOutcome.APPLIED -> "已收藏到「${pl.name}」"
+                                        NcmApi.PlaylistEditOutcome.ALREADY -> "「${pl.name}」里已经有这首歌了"
+                                        NcmApi.PlaylistEditOutcome.FAILED -> "收藏失败"
+                                    }
                                 }
                             }
                             .padding(horizontal = 13.dp, vertical = 9.dp),
@@ -199,15 +249,12 @@ fun CollectScreen(nav: NavHostController) {
                     )
                 }
             }
-            Spacer(Modifier.height(8.dp))
-            CircleIconButton(NcmIcons.Close, "退出", { nav.popBackStack() }, size = 38.dp, iconSize = 15.dp)
-            Spacer(Modifier.height(16.dp))
         }
 
         if (showCreate) {
             TextInputDialog(
                 title = "新建歌单",
-                placeholder = "歌单名称",
+                // ★ 2026-10-23 需求③：不再传框内占位文案（全站输入框占位统一删除）。
                 onConfirm = { name ->
                     showCreate = false
                     scope.launch {
@@ -215,7 +262,8 @@ fun CollectScreen(nav: NavHostController) {
                         if (id != null) {
                             toast = "已创建「$name」"
                             PageCache.invalidatePlaylists()
-                            playlists = PageCache.userPlaylists(SessionStore.uid).filter { it.isMine }
+                            playlists = PageCache.userPlaylists(SessionStore.uid)
+                                .filter { it.isMine && it.specialType != 5 }
                         } else toast = "创建失败"
                     }
                 },

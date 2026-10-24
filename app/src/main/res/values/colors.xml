@@ -1,6 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="bg">#0A0A0C</color>
+    <!-- 窗口底色（冷启动首帧前可见的 windowBackground）。
+         2026-10-03 默认主题改浅色后同步改为浅色板 Bg（#EFEFF3）——
+         否则浅色主题用户冷启动会先闪一帧深色再变亮。
+         深色主题用户冷启动的极短一帧会是浅色，取舍见 Theme.kt 浅色板注释。 -->
+    <color name="bg">#EFEFF3</color>
     <color name="accent">#EC4141</color>
     <color name="ic_launcher_background">#FFFFFF</color>
 </resources>

@@ -1,5 +1,8 @@
 package com.netmusiclite.ui.screens.player
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.drawable.BitmapDrawable
 import androidx.compose.animation.AnimatedVisibility
@@ -27,6 +30,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
@@ -71,11 +75,13 @@ import com.netmusiclite.ui.components.SongCover
 import com.netmusiclite.ui.components.StackedSongCard
 import com.netmusiclite.ui.components.SwipeBackFader
 import com.netmusiclite.ui.components.formatDate
+import com.netmusiclite.ui.components.pressStretch
 import com.netmusiclite.ui.components.rememberAutoClearMessage
 import com.netmusiclite.ui.components.songCoverModel
 import com.netmusiclite.ui.nav.Routes
 import com.netmusiclite.ui.nav.NavMotionKind
 import com.netmusiclite.ui.nav.NavMotionSpec
+import com.netmusiclite.ui.nav.OverlayBackHandler
 import com.netmusiclite.ui.nav.navigateWithMotion
 import com.netmusiclite.ui.theme.Accent
 import com.netmusiclite.ui.theme.OnAccent
@@ -103,6 +109,12 @@ fun SongBaikeScreen(nav: NavHostController, songId: Long) {
     var baike by remember { mutableStateOf<SongBaikeData?>(null) }
     var loading by remember { mutableStateOf(true) }
     var showCover by remember { mutableStateOf(false) }
+    // ★ 2026-10-22 用户口径「歌曲百科界面歌曲名称末尾一个小剪贴板按钮，点击出现弹窗歌曲名已复制」：
+    //   复制歌名后复用页内现成的 NcmToast + rememberAutoClearMessage（2.2s 自动消失，
+    //   与封面浮层的「右滑退出」提示同一套），不另造弹窗组件。
+    //   Context 在本层取一次即可（剪贴板是系统服务，不需要 Activity 级作用域）。
+    val ctx = LocalContext.current
+    val (copyToast, showCopyToast) = rememberAutoClearMessage()
 
     LaunchedEffect(songId) {
         val cur = PlayerEngine.current?.takeIf { it.id == songId }
@@ -119,7 +131,10 @@ fun SongBaikeScreen(nav: NavHostController, songId: Long) {
     Box(Modifier.fillMaxSize()) {
         // 2026-10-01：删除「歌曲百科」标题字样，只保留卡片；
         // NcmListPage 内部已按 StackedCardList 同口径横向收窄，长列表滚到圆屏弧区也不会被裁。
-        NcmListPage(horizontalInsetPx = 10) {
+        // ★ 2026-10-17 用户口径「歌曲百科（点击歌曲标题进入）禁用堆叠」：
+        //   m3e 下用 SINK —— 不调用 transformedHeight（不压缩条目占位），也不提供
+        //   SurfaceTransformation（Material 卡片不做缩放形变），卡片按真实高度平铺滚动。
+        NcmListPage(horizontalInsetPx = 10, m3eMode = com.netmusiclite.ui.m3e.M3eListMode.SINK) {
             // ① 三合一信息卡：标题/艺人 + 听歌数据 + 所属专辑（原三个独立卡片合并）
             item(key = "songinfo") {
                 SongInfoCard(
@@ -133,6 +148,19 @@ fun SongBaikeScreen(nav: NavHostController, songId: Long) {
                     },
                     onCover = {
                         showCover = true
+                    },
+                    // ★ 2026-10-22：歌名末尾剪贴板按钮 —— 复制到系统剪贴板并弹「歌曲名已复制」。
+                    //   歌名还没加载出来（空串）时直接忽略：复制空串没有意义，而且此时按钮本身也不显示
+                    //   （见 SongInfoCard 内的判据），这里再防一道。
+                    onCopy = {
+                        val title = song.title
+                        if (title.isNotBlank()) {
+                            runCatching {
+                                (ctx.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager)
+                                    ?.setPrimaryClip(ClipData.newPlainText("歌曲名", title))
+                            }
+                            showCopyToast("歌曲名已复制")
+                        }
                     },
                 )
             }
@@ -178,6 +206,10 @@ fun SongBaikeScreen(nav: NavHostController, songId: Long) {
         ) {
             CoverViewerOverlay(song = song, onDismiss = { showCover = false })
         }
+
+        // ★ 2026-10-22 复制歌名提示：位置与封面浮层里的 toast 保持一致（底部 60dp），
+        //   浮层打开时它会被浮层盖住 —— 复制按钮只在信息卡里，不会同时触发，互不干扰。
+        NcmToast(copyToast, Modifier.align(Alignment.BottomCenter).padding(bottom = 60.dp))
     }
 }
 
@@ -185,6 +217,9 @@ fun SongBaikeScreen(nav: NavHostController, songId: Long) {
  * 三合一歌曲信息卡（2026-09-30）：
  * 歌曲标题/艺人 → 听歌数据 → 所属专辑 → 专辑封面入口，同一张玻璃卡内以细分隔线分区。
  * 封面缩略图与「专辑封面」行都进封面查看浮层；专辑区整块可点进专辑详情。
+ *
+ * ★ 2026-10-22（用户口径）：标题行末尾加一颗小剪贴板按钮 —— 复制歌名并弹「歌曲名已复制」
+ *   （见 [CopyTitleButton]）。按钮独立于外侧的缩略图/专辑行点击，不影响任何既有交互。
  */
 @Composable
 private fun SongInfoCard(
@@ -192,6 +227,8 @@ private fun SongInfoCard(
     baike: SongBaikeData?,
     onAlbum: () -> Unit,
     onCover: () -> Unit,
+    /** 复制歌名（★ 2026-10-22）：非空歌名才显示按钮，点击区 24dp、图标 13dp */
+    onCopy: () -> Unit,
 ) {
     Column(
         Modifier
@@ -216,11 +253,23 @@ private fun SongInfoCard(
             }
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
-                Text(
-                    song.title.ifEmpty { "加载中…" },
-                    fontSize = 13.sp, fontWeight = FontWeight.Bold, color = TextPrimary,
-                    maxLines = 1, overflow = TextOverflow.Ellipsis,
-                )
+                // ★ 2026-10-22：标题行改成 Row —— 歌名后面紧跟复制按钮。
+                //   歌名用 weight(1f, fill = false)：按内容宽度排、最多占满剩余宽度，
+                //   所以按钮**紧贴歌名末尾**而不是被推到卡片右边缘；歌名过长时仍然吃满整行
+                //   并走原有的 maxLines=1 + Ellipsis（换行/省略行为与改动前一致）。
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        song.title.ifEmpty { "加载中…" },
+                        fontSize = 13.sp, fontWeight = FontWeight.Bold, color = TextPrimary,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false),
+                    )
+                    // 歌名为空（还在加载）时不显示按钮：复制空串无意义
+                    if (song.title.isNotBlank()) {
+                        Spacer(Modifier.width(4.dp))
+                        CopyTitleButton(onClick = onCopy)
+                    }
+                }
                 Text(song.artist, fontSize = 9.sp, color = TextSecondary, maxLines = 1)
             }
         }
@@ -319,6 +368,41 @@ private fun SongInfoCard(
     }
 }
 
+/**
+ * 歌名末尾的小剪贴板按钮（★ 2026-10-22 用户口径「歌曲名称末尾一个小剪贴板按钮」）。
+ *
+ * 图标直接复用 [NcmIcons.Copy]（默认主题是自绘「双层圆角矩形」复制图标，m3e 主题下是
+ * Material `ContentCopy`，与项目「复制邀请链接」等处同一枚图标）—— 不新增 path，
+ * 保证两套主题的图标风格与既有界面一致。
+ *
+ * 尺寸按口径压到最小：图标 13dp、点击区 24dp（四周留白），所以它挂在 13sp 的标题行里
+ * 不会把行高撑开、也不会推动右侧布局；点击区 24dp 仍是手表上可稳定点中的下限。
+ * 无涟漪（indication = null）+ pressStretch 缩放反馈：13dp 图形上的圆形波纹会糊成一团，
+ * 缩放反馈与页内其它小控件（如专辑行、封面入口）同一套手感。
+ */
+@Composable
+private fun CopyTitleButton(onClick: () -> Unit) {
+    Box(
+        Modifier
+            .size(24.dp)
+            .clip(CircleShape)
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = onClick,
+            )
+            .pressStretch(),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            NcmIcons.Copy,
+            contentDescription = "复制歌曲名",
+            tint = TextSecondary,
+            modifier = Modifier.size(13.dp),
+        )
+    }
+}
+
 /** 卡片内分区细线 */
 @Composable
 private fun DividerLine() {
@@ -334,6 +418,8 @@ private fun DividerLine() {
  *   设备 API 30 无 RenderEffect，模糊走 ImageBlur 预计算）
  * - 底部 = 「保存到本地」按钮（Download 图标），经 MediaSaver 写入系统下载文件夹
  * - 右上关闭按钮 / 点背景空白处关闭；右上横向拖拽被本层消费，避免误触发页面右滑返回
+ * - 系统 back（含华为式被系统吃掉的右滑）同样先关本浮层、留在百科页（2026-10-07 修复：
+ *   此前系统 back 会直接 pop 掉整个百科页）
  */
 @Composable
 private fun CoverViewerOverlay(song: Song, onDismiss: () -> Unit) {
@@ -347,6 +433,9 @@ private fun CoverViewerOverlay(song: Song, onDismiss: () -> Unit) {
     var glowColor by remember { mutableStateOf(Color.White) }
     var saving by remember { mutableStateOf(false) }
     val (toast, showToast) = rememberAutoClearMessage()
+
+    // 系统 back（含华为式被系统吃掉的右滑）：先关本浮层、留在歌曲百科页，不动导航（2026-10-07 同批修复）
+    OverlayBackHandler { onDismiss() }
 
     LaunchedEffect(song.id, song.coverUrl) {
         val model = songCoverModel(song) ?: return@LaunchedEffect

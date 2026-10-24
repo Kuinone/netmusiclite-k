@@ -13,7 +13,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -28,21 +27,34 @@ import com.netmusiclite.data.DownloadStore
 import com.netmusiclite.data.PlayMode
 import com.netmusiclite.data.PlayerEngine
 import com.netmusiclite.ui.components.CircleIconButton
+import com.netmusiclite.ui.components.NcmToast
 import com.netmusiclite.ui.components.ambientSurfaceColor
+import com.netmusiclite.ui.components.rememberAutoClearMessage
 import com.netmusiclite.ui.nav.NavMotionKind
 import com.netmusiclite.ui.nav.Routes
 import com.netmusiclite.ui.nav.navigateWithMotion
-import com.netmusiclite.ui.theme.TextPrimary
-import com.netmusiclite.ui.theme.TextSecondary
-import kotlinx.coroutines.launch
+import com.netmusiclite.ui.theme.PlayTextPrimary
+import com.netmusiclite.ui.theme.PlayTextSecondary
+import com.netmusiclite.ui.theme.PlayToneScope
 
-/** 播放页“更多”操作：中心网格按实际窗口 dp 缩放，留出圆屏边缘安全区。 */
+/** 播放页“更多”操作：中心网格按实际窗口 dp 缩放，留出圆屏边缘安全区。
+ *  ★ 2026-10-07「封面模糊明暗对调」：整页包在 [PlayToneScope] 里（与播放页/歌词页同口径）。 */
 @Composable
 fun MoreScreen(nav: NavHostController) {
+    if (com.netmusiclite.data.AppearancePrefs.isM3e) {
+        com.netmusiclite.ui.m3e.M3eMore(nav)
+        return
+    }
+    PlayToneScope { MoreScreenContent(nav) }
+}
+
+@Composable
+private fun MoreScreenContent(nav: NavHostController) {
     val song = PlayerEngine.current
     val mode = PlayerEngine.playMode
     val downloaded = song != null && DownloadStore.states[song.id] == 2
-    val scope = rememberCoroutineScope()
+    val downloading = song != null && DownloadStore.states[song.id] == 1
+    val (toast, showToast) = rememberAutoClearMessage()
 
     BoxWithConstraints(
         Modifier.fillMaxSize().background(ambientSurfaceColor()),
@@ -66,7 +78,7 @@ fun MoreScreen(nav: NavHostController) {
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,
         ) {
-            Text("更多", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
+            Text("更多", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = PlayTextPrimary)
             Spacer(Modifier.height(titleGap))
 
             Row(
@@ -89,14 +101,26 @@ fun MoreScreen(nav: NavHostController) {
                 }
                 MoreButton(
                     icon = MoreIcons.Download,
-                    label = if (downloaded) "已下载" else "下载",
+                    label = when {
+                        downloading -> "下载中…"
+                        downloaded -> "已下载"
+                        else -> "下载"
+                    },
                     dim = downloaded || song == null,
                     size = buttonSize,
                     itemWidth = itemWidth,
                 ) {
                     if (song == null) return@MoreButton
-                    if (DownloadStore.states[song.id] != 2) {
-                        scope.launch { DownloadStore.download(song) }
+                    // 2026-10-03 用户要求：点击显示「开始下载」字样；改走 enqueue 后台队列
+                    // （原 scope.launch 直下在离开更多页时会被取消，状态卡「下载中」）
+                    when {
+                        DownloadStore.states[song.id] == 2 -> Unit
+                        DownloadStore.states[song.id] == 1 -> showToast("正在下载中")
+                        DownloadStore.pendingCopy().any { it.id == song.id } -> showToast("已在下载队列")
+                        else -> {
+                            showToast("开始下载")
+                            DownloadStore.enqueue(listOf(song))
+                        }
                     }
                 }
                 MoreButton(
@@ -150,6 +174,8 @@ fun MoreScreen(nav: NavHostController) {
                 )
             }
         }
+        // 轻提示（开始下载/正在下载中）：圆屏底部留安全区，避开第二排按钮文字
+        NcmToast(toast, Modifier.align(Alignment.BottomCenter).padding(bottom = 12.dp))
     }
 }
 
@@ -177,7 +203,7 @@ private fun MoreButton(
             modifier = Modifier.width(itemWidth),
             fontSize = 8.5.sp,
             lineHeight = 10.sp,
-            color = if (dim) TextSecondary.copy(alpha = 0.5f) else TextSecondary,
+            color = if (dim) PlayTextSecondary.copy(alpha = 0.5f) else PlayTextSecondary,
             textAlign = TextAlign.Center,
             maxLines = 1,
             overflow = TextOverflow.Clip,

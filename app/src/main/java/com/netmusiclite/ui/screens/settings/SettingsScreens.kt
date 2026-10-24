@@ -17,7 +17,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.layout.fillMaxSize
 import com.netmusiclite.ui.theme.Bg
-import androidx.compose.foundation.lazy.LazyColumn
+import com.netmusiclite.ui.m3e.AdaptiveLazyColumn as LazyColumn
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -33,6 +33,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import com.netmusiclite.ui.components.pressStretch
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
@@ -53,6 +54,7 @@ import com.netmusiclite.ui.components.StackedCard
 import com.netmusiclite.ui.components.StackedCardList
 import com.netmusiclite.ui.components.StackedIconCard
 import com.netmusiclite.ui.components.formatDate
+import com.netmusiclite.ui.components.wallpaperShown
 import com.netmusiclite.ui.nav.NavMotionKind
 import com.netmusiclite.ui.nav.Routes
 import com.netmusiclite.ui.nav.navigateWithMotion
@@ -60,11 +62,13 @@ import com.netmusiclite.data.AppearancePrefs
 import com.netmusiclite.data.BackgroundStore
 import com.netmusiclite.data.NcmApi
 import com.netmusiclite.data.PRESET_ACCENTS
+import com.netmusiclite.data.PlayPageStyle
 import com.netmusiclite.data.QualityPrefs
 import com.netmusiclite.R
 import com.netmusiclite.data.ThemeMode
 import com.netmusiclite.ui.screens.login.LoginQrScreen
 import com.netmusiclite.ui.theme.Accent
+import com.netmusiclite.ui.theme.FONT_WEIGHT_LABELS
 import com.netmusiclite.ui.theme.SurfaceStrong
 import com.netmusiclite.ui.theme.AccentSoft
 import com.netmusiclite.ui.theme.Gold
@@ -75,12 +79,24 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.io.File
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.rememberCoroutineScope
+import com.netmusiclite.update.UpdateChecker
+import com.netmusiclite.update.UpdateFlow
+import com.netmusiclite.update.UpdateInfo
+import com.netmusiclite.ui.components.UpdateAvailableDialog
+import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 
 /** 设置：我的账号 / 缓存清理（卡片堆叠风格） */
 @Composable
 fun SettingsScreen(nav: NavHostController) {
+    if (AppearancePrefs.isM3e) {
+        com.netmusiclite.ui.m3e.M3eMainSettingsScreen(nav)
+        return
+    }
     val loudnessEnabled = LoudnessPrefs.enabled
-    StackedCardList(title = "设置", progressTotal = 7, horizontalInsetPx = 10) {
+    StackedCardList(title = "设置", progressTotal = 15, horizontalInsetPx = 10) {
         item(key = "account") {
             StackedIconCard(
                 title = "我的账号",
@@ -99,6 +115,72 @@ fun SettingsScreen(nav: NavHostController) {
                 icon = NcmIcons.Theme,
                 navMotionKind = NavMotionKind.Pill,
             ) { nav.navigateWithMotion(Routes.THEME) }
+        }
+        // ★ 2026-10-11 用户口径「设置页主题下方添加在歌词页常亮屏幕开关」：
+        //   开 = 停留在歌词页期间屏幕不按系统息屏时间熄灭（FLAG_KEEP_SCREEN_ON，
+        //   挂/清在 LyricsScreen 的 DisposableEffect）；离开歌词页立即恢复系统息屏节奏。
+        //   默认关（续航优先），主设置页直接给开关 —— 位置按用户指定：紧跟「主题」入口下方。
+        //   卡片样式与下方「歌曲响度均衡」开关一致（主设置页的开关形态）。
+        item(key = "lyric_keep_on") {
+            val keepOn = AppearancePrefs.lyricKeepScreenOn
+            StackedCard(onClick = { AppearancePrefs.setLyricKeepScreenOn(!keepOn) }) {
+                Box(
+                    Modifier
+                        .size(34.dp)
+                        .clip(CircleShape)
+                        .background(if (keepOn) Accent else SurfaceStrong),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        NcmIcons.Moon, contentDescription = null,
+                        tint = if (keepOn) com.netmusiclite.ui.theme.OnAccent else TextPrimary,
+                        modifier = Modifier.size(19.dp),
+                    )
+                }
+                Spacer(Modifier.width(11.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("歌词页屏幕常亮", fontSize = 14.sp, fontWeight = FontWeight.Medium, color = TextPrimary)
+                    Text(
+                        if (keepOn) "已开启 · 停留在歌词页时屏幕不熄灭" else "已关闭 · 听歌看歌词时屏幕按系统节奏熄灭",
+                        fontSize = 8.sp, color = TextSecondary, maxLines = 1,
+                    )
+                    Text("只作用于歌词页，离开立即恢复息屏", fontSize = 8.sp, color = TextTertiary, maxLines = 1)
+                }
+                Spacer(Modifier.width(8.dp))
+                Box(
+                    Modifier
+                        .size(18.dp)
+                        .clip(CircleShape)
+                        .then(if (keepOn) Modifier.background(Accent) else Modifier.border(1.dp, TextTertiary, CircleShape)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (keepOn) {
+                        Icon(NcmIcons.Check, contentDescription = "已开启", tint = com.netmusiclite.ui.theme.OnAccent, modifier = Modifier.size(11.dp))
+                    }
+                }
+            }
+        }
+        // ★ 2026-10-03 表盘形状（用户口径「首次启动向导第一页改成方表圆表选择」）：
+        //   向导里选过一次，这里给一个随时可改的出口 —— 形状决定全局圆形裁切与弧边内缩，
+        //   选错会让整个界面长期变形，必须能改回来。复用向导第一页的选择界面（见 AppNav 的 Routes.SHAPE）。
+        item(key = "shape") {
+            StackedIconCard(
+                title = "表盘形状",
+                subtitle = "当前：${com.netmusiclite.data.ScreenShapePrefs.label()} · 边缘裁切适配",
+                icon = NcmIcons.Watch,
+                navMotionKind = NavMotionKind.Pill,
+            ) { nav.navigateWithMotion(Routes.SHAPE) }
+        }
+        // ★ 2026-10-04 表冠适配（用户口径「设置里加一栏表冠适配：音量页一个选项、列表页一个选项」）：
+        //   各厂商 ROM 上报的通道与符号都不同（华为原始符号与标准相反、OPPO 表冠声明成 SOURCE_MOUSE），
+        //   归一化无法穷举厂商 —— 给用户两个「正 / 反」开关，点选立即生效（见 data/RotaryTuning）。
+        item(key = "rotary") {
+            StackedIconCard(
+                title = "表冠适配",
+                subtitle = com.netmusiclite.data.RotaryTuning.label(),
+                icon = NcmIcons.Refresh,
+                navMotionKind = NavMotionKind.Pill,
+            ) { nav.navigateWithMotion(Routes.ROTARY) }
         }
         item(key = "quality") {
             StackedIconCard(
@@ -150,6 +232,110 @@ fun SettingsScreen(nav: NavHostController) {
                 }
             }
         }
+        // ★ 2026-10-18 用户口径「在设置里歌曲响度对齐下方加一个关闭播放页转动表冠调节音量的选项」：
+        //   语义是「关闭」—— 默认关着（表冠照旧调音量），打开后播放页转表冠不再动音量。
+        //   与上面响度项同款卡片形态（左图标 + 标题副标题 + 右侧状态点），保持列表观感一致。
+        item(key = "crown_volume") {
+            val crownOff = com.netmusiclite.data.CrownVolumePrefs.disabled
+            StackedCard(onClick = {
+                com.netmusiclite.data.CrownVolumePrefs.disabled = !crownOff
+            }) {
+                Box(
+                    Modifier
+                        .size(34.dp)
+                        .clip(CircleShape)
+                        .background(if (crownOff) Accent else SurfaceStrong),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        NcmIcons.Watch, contentDescription = null,
+                        tint = if (crownOff) com.netmusiclite.ui.theme.OnAccent else TextPrimary,
+                        modifier = Modifier.size(19.dp),
+                    )
+                }
+                Spacer(Modifier.width(11.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("关闭表冠调音量", fontSize = 14.sp, fontWeight = FontWeight.Medium, color = TextPrimary)
+                    Text(
+                        if (crownOff) "已关闭 · 播放页转表冠不调节音量"
+                        else "已开启 · 播放页转表冠调节音量",
+                        fontSize = 8.sp, color = TextSecondary, maxLines = 1,
+                    )
+                    Text("仅影响播放页，音量键与音量按钮不受影响", fontSize = 8.sp, color = TextTertiary, maxLines = 1)
+                }
+                Spacer(Modifier.width(8.dp))
+                Box(
+                    Modifier
+                        .size(18.dp)
+                        .clip(CircleShape)
+                        .then(if (crownOff) Modifier.background(Accent) else Modifier.border(1.dp, TextTertiary, CircleShape)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (crownOff) {
+                        Icon(NcmIcons.Check, contentDescription = "已关闭", tint = com.netmusiclite.ui.theme.OnAccent, modifier = Modifier.size(11.dp))
+                    }
+                }
+            }
+        }
+        // ★ 2026-10-24 实验性手势操控：前台 ACC+GYRO 本地识别（非 ROM 桥接），默认关闭。
+        //   与「关闭表冠调音量」同款卡片形态；开关本身由 GestureControl 同步传感器生命周期。
+        item(key = "gesture") {
+            val gestureOn = com.netmusiclite.data.GesturePrefs.enabled
+            val ctx = androidx.compose.ui.platform.LocalContext.current
+            StackedCard(onClick = {
+                if (gestureOn) {
+                    com.netmusiclite.data.GestureControl.setEnabled(ctx, false)
+                } else {
+                    com.netmusiclite.ui.components.GestureDonationGate.requestEnable {
+                        com.netmusiclite.data.GestureControl.setEnabled(ctx, true)
+                    }
+                }
+            }) {
+                Box(
+                    Modifier
+                        .size(34.dp)
+                        .clip(CircleShape)
+                        .background(if (gestureOn) Accent else SurfaceStrong),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        NcmIcons.Watch, contentDescription = null,
+                        tint = if (gestureOn) com.netmusiclite.ui.theme.OnAccent else TextPrimary,
+                        modifier = Modifier.size(19.dp),
+                    )
+                }
+                Spacer(Modifier.width(11.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("手势操控（实验性）", fontSize = 14.sp, fontWeight = FontWeight.Medium, color = TextPrimary)
+                    Text(
+                        if (gestureOn) "已开启 · 仅本应用前台时识别"
+                        else "已关闭 · 实验性功能，默认关闭",
+                        fontSize = 8.sp, color = TextSecondary, maxLines = 1,
+                    )
+                    Text("双指捏一捏 · 手心朝上/下切歌 · 竖腕暂停", fontSize = 8.sp, color = TextTertiary, maxLines = 1)
+                }
+                Spacer(Modifier.width(8.dp))
+                Box(
+                    Modifier
+                        .size(18.dp)
+                        .clip(CircleShape)
+                        .then(if (gestureOn) Modifier.background(Accent) else Modifier.border(1.dp, TextTertiary, CircleShape)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (gestureOn) {
+                        Icon(NcmIcons.Check, contentDescription = "已开启", tint = com.netmusiclite.ui.theme.OnAccent, modifier = Modifier.size(11.dp))
+                    }
+                }
+            }
+        }
+        item(key = "gesture_help") {
+            StackedIconCard(
+                title = "手势说明与灵敏度",
+                subtitle = "双指捏一捏 · 上/下一首 · 暂停/继续",
+                icon = NcmIcons.Info,
+                navMotionKind = NavMotionKind.Pill,
+            ) { nav.navigateWithMotion(Routes.GESTURE) }
+        }
         item(key = "cache") {
             StackedIconCard(
                 title = "缓存清理", subtitle = "清理图片与临时缓存", icon = NcmIcons.Refresh,
@@ -157,6 +343,18 @@ fun SettingsScreen(nav: NavHostController) {
             ) {
                 nav.navigateWithMotion(Routes.CACHE_CLEAN)
             }
+        }
+        // ★ 2026-10-07 用户口径「在设置免责声明上方添加特别鸣谢栏目」：
+        //   独立静态页（页内内容见 SupportScreens.kt 的 ThanksScreen）——
+        //   名单顺序每次进入随机，页签入口固定在这里、与免责声明相邻。
+        item(key = "thanks") {
+            StackedIconCard(
+                title = "特别鸣谢",
+                subtitle = "感谢为本项目提供帮助的朋友",
+                icon = NcmIcons.Star,
+                iconTint = Gold,
+                navMotionKind = NavMotionKind.Pill,
+            ) { nav.navigateWithMotion(Routes.THANKS) }
         }
         item(key = "disclaimer") {
             StackedIconCard(
@@ -175,6 +373,26 @@ fun SettingsScreen(nav: NavHostController) {
                 navMotionKind = NavMotionKind.Pill,
             ) { nav.navigateWithMotion(Routes.ABOUT) }
         }
+        // ★ 2026-10-03 用户口径「设置里添加加入官方QQ群/捐赠作者选项，qq群在上」：
+        //   两条入口按用户指定顺序排列：QQ群 → 捐赠作者，各自独立成页
+        //   （页内内容见 SupportScreens.kt）。
+        item(key = "qq_group") {
+            StackedIconCard(
+                title = "加入官方QQ群",
+                subtitle = "官方群 1127884054 · 扫码加入",
+                icon = NcmIcons.Friends,
+                navMotionKind = NavMotionKind.Pill,
+            ) { nav.navigateWithMotion(Routes.QQ_GROUP) }
+        }
+        item(key = "donate") {
+            StackedIconCard(
+                title = "捐赠作者",
+                subtitle = "微信 / 支付宝扫码支持作者",
+                icon = NcmIcons.Heart,
+                iconTint = Accent,
+                navMotionKind = NavMotionKind.Pill,
+            ) { nav.navigateWithMotion(Routes.DONATE) }
+        }
         item(key = "credit") {
             Text(
                 "作者：昼小风\n未经授权请勿转载",
@@ -191,7 +409,13 @@ fun SettingsScreen(nav: NavHostController) {
 /** 设置页「主题」入口副标题：明暗 · 配色来源 · 背景状态（读的都是 Compose 状态，会自动刷新） */
 private fun themeSummary(): String {
     val color = if (AppearancePrefs.dynamicColor) "自动取色" else AppearancePrefs.accentLabel()
-    val bg = if (BackgroundStore.ready) "自定义背景" else "默认背景"
+    // ★ 2026-10-07：背景状态按**实际在画的那层底**报 —— 封面模糊外观且「保留取色」关时，
+    //   自定义壁纸全程不露面（外围页由模糊封面顶替），还报「自定义背景」就是骗人。
+    val bg = when {
+        AppearancePrefs.coverBlurOuter -> "封面模糊背景"
+        BackgroundStore.ready -> "自定义背景"
+        else -> "默认背景"
+    }
     return "${AppearancePrefs.modeLabel()} · $color · $bg"
 }
 
@@ -330,7 +554,7 @@ fun CacheCleanScreen(nav: NavHostController) {
                     Modifier
                         .clip(RoundedCornerShape(50))
                         .background(Accent)
-                        .clickable {
+                        .pressStretch().clickable {
                             java.util.concurrent.Executors.newSingleThreadExecutor().execute {
                                 ctx.cacheDir.listFiles()?.forEach { it.deleteRecursively() }
                             }
@@ -479,7 +703,7 @@ fun ConsentScreen(onAgree: () -> Unit, onDecline: () -> Unit) {
                     modifier = Modifier
                         .clip(RoundedCornerShape(50))
                         .background(SurfaceStrong)
-                        .clickable { onDecline() }
+                        .pressStretch().clickable { onDecline() }
                         .padding(horizontal = 13.dp, vertical = 8.dp),
                 )
                 Spacer(Modifier.width(10.dp))
@@ -489,7 +713,7 @@ fun ConsentScreen(onAgree: () -> Unit, onDecline: () -> Unit) {
                     modifier = Modifier
                         .clip(RoundedCornerShape(50))
                         .background(Accent)
-                        .clickable { onAgree() }
+                        .pressStretch().clickable { onAgree() }
                         .padding(horizontal = 15.dp, vertical = 8.dp),
                 )
             }
@@ -500,39 +724,88 @@ fun ConsentScreen(onAgree: () -> Unit, onDecline: () -> Unit) {
 /**
  * 主题设置（2026-10-01 新增；同日合并原「背景与玻璃」）：
  * 一个入口统管全部影响观感的设置 ——
- *   配色侧：外观模式（深色 / 浅色）/ 跟随壁纸取色 / M3 种子色板；
- *   材质侧：背景图（选图 · 压暗 · 模糊）/ 玻璃卡片（材质 · 强度）/ 播放页取色；
+ *   配色侧：外观模式（深色 / 浅色 / 封面模糊＝跟随封面自动明暗）/ 跟随壁纸取色 / M3 种子色板；
+ *   材质侧：背景图（选图 · 压暗 · 模糊）/ 玻璃卡片（材质 · 强度）；
+ *   页面侧：播放页面风格（取色 / 封面模糊 / 自定义，2026-10-06 新增，取代原「保留取色」开关）；
  *   歌词侧：歌词扫光开关（2026-10-02 新增）。
  *
  * 合并理由：玻璃材质的观感直接由主题明暗与种子色决定（浅色主题下玻璃 alpha 是另一套标定），
  * 拆成两个入口只会让人不知道该去哪调。合并后**无任何重复项**：
  *   · 「种子色」与「跟随壁纸取色」互斥 —— 自动取色开启时色板整体变淡且点击无效；
  *   · 「背景模糊」作用于底图、「卡片模糊」作用于玻璃取样，作用对象不同；
- *   · 「保留取色」只是播放页/歌词页的例外开关，仅这两页生效。
+ *   · 「播放页面风格」管的是播放器组三页的底（取色 / 封面模糊 / 透壁纸），与上面两项互不重叠。
  * 全部项直接写 Compose 状态，改动立即全局生效（无需重启）。
  */
 @Composable
 fun ThemeSettingsScreen(nav: NavHostController) {
-    val ctx = androidx.compose.ui.platform.LocalContext.current
-    val pick = androidx.activity.compose.rememberLauncherForActivityResult(
-        androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia()
-    ) { uri ->
-        if (uri != null) BackgroundStore.setFrom(uri, ctx.contentResolver)
+    if (AppearancePrefs.isM3e) {
+        com.netmusiclite.ui.m3e.M3eThemeSettingsScreen(nav)
+        return
     }
-
     val mode = AppearancePrefs.mode
     val dynamicOn = AppearancePrefs.dynamicColor
     val bgReady = BackgroundStore.ready
+    // ★ 2026-10-07 用户 bug「选择自定义图片后，封面模糊主题浅色下玻璃卡片效果不生效」：
+    //   玻璃开关 / 滑杆的可见性判据从「有没有壁纸」（bgReady）改成「壁纸**是否真的在画**」
+    //   （bgLive = wallpaperShown()）—— 封面模糊顶掉壁纸时，壁纸在设置页身后也没露面，
+    //   玻璃材质走的是「无图」分支，滑杆/开关必须按真实分支显示（与 frostedGlass 同判据）。
+    //   ⚠ 「更换背景图」「恢复默认背景」仍用 bgReady：那两张卡管的是**库存**，不是显示。
+    val bgLive = bgReady && wallpaperShown()
+    // 播放页面风格：读的是**生效值**（自定义在没壁纸时已回落取色，选中环与副标题才不会骗人）
+    val playStyle = AppearancePrefs.playStyle
+    val customVisible = AppearancePrefs.playStyleCustomVisible
+
+    // ★ 2026-10-17：M3E 新主题公告改为「本版本首次打开应用时」弹一次（见 AppNav 根层），
+    //   这里的主题切换入口不再重复弹公告，只负责「首次使用该主题 → 强制看对应指南」。
+    fun applyThemeStyle(style: String) {
+        AppearancePrefs.setInterfaceStyle(style)
+        // 第一次使用该主题 → 强制观看对应手势指南（看完自动返回本页）
+        if (!com.netmusiclite.data.GuideStore.seen(style)) {
+            nav.navigateWithMotion(
+                Routes.GUIDE_QUICK,
+                com.netmusiclite.ui.nav.NavMotionSpec(NavMotionKind.Directional),
+            )
+        }
+    }
+
+    fun selectThemeStyle(style: String) = applyThemeStyle(style)
 
     StackedCardList(title = "主题") {
+        item(key = "interface_classic") {
+            StackedIconCard(
+                title = "经典",
+                subtitle = "已选中",
+                icon = NcmIcons.Check,
+            ) { selectThemeStyle("classic") }
+        }
+        item(key = "interface_m3e") {
+            StackedIconCard(
+                title = "M3E",
+                subtitle = "Material 3 Expressive",
+                icon = NcmIcons.Theme,
+            ) { selectThemeStyle("m3e") }
+        }
         // ───────────────── 配色 ─────────────────
         item(key = "mode") {
-            StackedCard(height = 84.dp) {
+            StackedCard(height = 92.dp) {
                 Column(Modifier.weight(1f)) {
                     Text("外观模式", fontSize = 12.sp, color = TextPrimary, fontWeight = FontWeight.Medium)
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(3.dp))
+                    Text(
+                        when (mode) {
+                            // ★ 2026-10-07 用户口径「增加外观模式封面模糊」：全局自动明暗。
+                            //   副标题报出**当前实际解析结果**（跟随封面现在是浅还是深），
+                            //   否则选完之后没有地方能看到它此刻按封面判成了什么。
+                            ThemeMode.COVER_BLUR ->
+                                "跟随封面自动明暗 · 当前${if (AppearancePrefs.isLight) "浅色" else "深色"}"
+                            ThemeMode.LIGHT -> "全站浅色"
+                            else -> "全站深色"
+                        },
+                        fontSize = 9.sp, color = TextSecondary, maxLines = 1,
+                    )
+                    Spacer(Modifier.height(7.dp))
                     Row(Modifier.fillMaxWidth()) {
-                        // ⚠ 只保留两个选项：原「跟随系统」已移除 —— 手表系统深浅恒定，
+                        // ⚠ 只保留三个选项：原「跟随系统」已移除 —— 手表系统深浅恒定，
                         //   它与「深色」效果完全相同，是个点下去看不出区别的冗余项。
                         ModeChip("深色", mode == ThemeMode.DARK) {
                             AppearancePrefs.setMode(ThemeMode.DARK)
@@ -540,7 +813,101 @@ fun ThemeSettingsScreen(nav: NavHostController) {
                         ModeChip("浅色", mode == ThemeMode.LIGHT) {
                             AppearancePrefs.setMode(ThemeMode.LIGHT)
                         }
+                        // 封面模糊 = 全局自动明暗（2026-10-07）：盖在「播放页面风格 = 封面模糊」
+                        // 之上不冲突 —— 那个管播放器组底图，这个管全 App 明暗。
+                        ModeChip("封面模糊", mode == ThemeMode.COVER_BLUR) {
+                            AppearancePrefs.setMode(ThemeMode.COVER_BLUR)
+                        }
                     }
+                }
+            }
+        }
+        // ★ 2026-10-07 用户口径：选择「封面模糊」外观时才出现的「保留取色」开关 ——
+        //   打开 = 外围页（主页等非播放器组页面）保留原有取色/壁纸机制，模糊只在播放页
+        //   及其附属页生效；关闭（默认）= 外围页背景也用模糊封面（与播放页同一张底）。
+        //   播放器组三页不受本开关影响，仍听「播放页面风格」。
+        if (mode == ThemeMode.COVER_BLUR) {
+            item(key = "cover_keep_tint") {
+                StackedCard(height = 68.dp) {
+                    Column(Modifier.weight(1f)) {
+                        Text("保留取色", fontSize = 12.sp, color = TextPrimary, fontWeight = FontWeight.Medium)
+                        Text(
+                            if (AppearancePrefs.coverKeepTint) {
+                                "外围页继续用取色/壁纸，模糊只在播放页生效"
+                            } else {
+                                "主页等外围页的背景也用模糊封面"
+                            },
+                            fontSize = 9.sp, color = TextSecondary, maxLines = 2,
+                        )
+                    }
+                    androidx.compose.material3.Switch(
+                        checked = AppearancePrefs.coverKeepTint,
+                        onCheckedChange = { AppearancePrefs.setCoverKeepTint(it) },
+                    )
+                }
+            }
+        }
+        // ★ 2026-10-06 用户口径「设置主题栏目里新增播放页面风格：取色 / 封面模糊 / 自定义，
+        //   当未设置自定义壁纸时不显示自定义选项」：只作用于播放器组三页
+        //   （播放页 / 歌词页 / 更多页），其余页面照旧透出全局背景。
+        //   本项取代原「播放页/歌词页保留取色」开关（存量值在 AppearancePrefs.init 里迁移）。
+        item(key = "play_style") {
+            StackedCard(height = 92.dp) {
+                Column(Modifier.weight(1f)) {
+                    Text("播放页面风格", fontSize = 12.sp, color = TextPrimary, fontWeight = FontWeight.Medium)
+                    Spacer(Modifier.height(3.dp))
+                    Text(
+                        when (playStyle) {
+                            PlayPageStyle.COVER_BLUR -> "封面放大重模糊打底，歌词逐字点亮"
+                            PlayPageStyle.CUSTOM -> "播放页透出自定义壁纸"
+                            else -> "歌曲封面主色作底，与全站氛围一致"
+                        },
+                        fontSize = 9.sp, color = TextSecondary, maxLines = 1,
+                    )
+                    Spacer(Modifier.height(7.dp))
+                    Row(Modifier.fillMaxWidth()) {
+                        ModeChip("取色", playStyle == PlayPageStyle.AMBIENT) {
+                            AppearancePrefs.setPlayStyle(PlayPageStyle.AMBIENT)
+                        }
+                        ModeChip("封面模糊", playStyle == PlayPageStyle.COVER_BLUR) {
+                            AppearancePrefs.setPlayStyle(PlayPageStyle.COVER_BLUR)
+                        }
+                        // 没有壁纸就没有可透出的东西，这个选项不显示（存量选择也会回落取色）
+                        if (customVisible) {
+                            ModeChip("自定义", playStyle == PlayPageStyle.CUSTOM) {
+                                AppearancePrefs.setPlayStyle(PlayPageStyle.CUSTOM)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // ★ 2026-10-07 用户口径「深色外观 + 播放页风格封面模糊时，下方出现『使用浅色封面模糊』开关；
+        //   浅色外观 + 封面模糊时，出现『使用深色封面模糊』开关」：
+        //   开 = 播放器组三页整体（底图明暗 + 卡片/文字/强调色）对调到另一种明暗；
+        //   关（默认）= 跟随外观模式，升级后观感不变。
+        //   外观模式选「封面模糊」时没有可对调的方向（本来就逐封面自动明暗），不显示本开关。
+        if (playStyle == PlayPageStyle.COVER_BLUR &&
+            (mode == ThemeMode.DARK || mode == ThemeMode.LIGHT)
+        ) {
+            val toLight = mode == ThemeMode.DARK
+            item(key = "cover_blur_invert") {
+                StackedCard(height = 68.dp) {
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            if (toLight) "使用浅色封面模糊" else "使用深色封面模糊",
+                            fontSize = 12.sp, color = TextPrimary, fontWeight = FontWeight.Medium,
+                        )
+                        Text(
+                            if (toLight) "播放页/歌词页改用浅色观感"
+                            else "播放页/歌词页改用深色观感",
+                            fontSize = 9.sp, color = TextSecondary, maxLines = 2,
+                        )
+                    }
+                    androidx.compose.material3.Switch(
+                        checked = AppearancePrefs.coverBlurInvert,
+                        onCheckedChange = { AppearancePrefs.setCoverBlurInvert(it) },
+                    )
                 }
             }
         }
@@ -549,7 +916,7 @@ fun ThemeSettingsScreen(nav: NavHostController) {
                 Column(Modifier.weight(1f)) {
                     Text("跟随壁纸取色", fontSize = 12.sp, color = TextPrimary, fontWeight = FontWeight.Medium)
                     Text(
-                        AppearancePrefs.dynamicSourceLabel(),
+                        AppearancePrefs.dynamicSourceLabel(bgLive),
                         fontSize = 9.sp, color = TextSecondary, maxLines = 2,
                     )
                 }
@@ -579,16 +946,64 @@ fun ThemeSettingsScreen(nav: NavHostController) {
                 }
             }
         }
+        // ★ 2026-10-03 用户口径「设置主题里增加字体大小调整滑块以及字体粗细调整滑块」：
+        //   字号覆写 LocalDensity.fontScale、字重平移 FontFamily.Resolver
+        //   （实现见 Theme.kt / FontWeightShift.kt），拖动即时全局生效；
+        //   右侧读数让档位可见（百分比 / 细·标准·加粗·特粗）。
+        item(key = "font_size") {
+            StackedCard(height = 88.dp) {
+                Column(Modifier.padding(horizontal = 16.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("字体大小", fontSize = 12.sp, color = TextPrimary, fontWeight = FontWeight.Medium)
+                        Spacer(Modifier.weight(1f))
+                        Text(
+                            "${(AppearancePrefs.fontScale * 100).roundToInt()}%",
+                            fontSize = 10.sp, color = Accent, fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    androidx.compose.material3.Slider(
+                        value = AppearancePrefs.fontScale,
+                        onValueChange = { AppearancePrefs.setFontScale(it) },
+                        valueRange = 0.8f..1.3f, // 6 档：80% / 90% / 100% / 110% / 120% / 130%
+                        steps = 4,
+                    )
+                }
+            }
+        }
+        item(key = "font_weight") {
+            StackedCard(height = 88.dp) {
+                Column(Modifier.padding(horizontal = 16.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("字体粗细", fontSize = 12.sp, color = TextPrimary, fontWeight = FontWeight.Medium)
+                        Spacer(Modifier.weight(1f))
+                        Text(
+                            FONT_WEIGHT_LABELS.getOrElse(AppearancePrefs.fontWeightLevel) { "标准" },
+                            fontSize = 10.sp, color = Accent, fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    androidx.compose.material3.Slider(
+                        value = AppearancePrefs.fontWeightLevel.toFloat(),
+                        onValueChange = { AppearancePrefs.setFontWeightLevel(it.roundToInt()) },
+                        valueRange = 0f..3f, // 4 档：细 / 标准 / 加粗 / 特粗
+                        steps = 2,
+                    )
+                }
+            }
+        }
         // ───────────────── 背景与玻璃（原独立页，已合并到此） ─────────────────
+        // ★ 2026-10-03 用户口径「增加一个系统内置管理器，在自定义壁纸的时候点击按钮后进入」：
+        //   点击不再直接拉系统相册，先进内置图片管理器（自动扫描 2020 年后的系统图片，
+        //   双列弧形布局点选即设背景；权限在那边进入时申请，拒绝时内置相册作兜底）。
         item(key = "pick") {
             StackedIconCard(
                 title = if (bgReady) "更换背景图" else "选择背景图",
-                subtitle = if (bgReady) "背景已启用，选择即覆盖" else "从相册选择一张图作全局背景",
+                subtitle = if (bgReady) "背景已启用，选择即覆盖" else "内置相册，扫描系统图片任选一张",
                 icon = NcmIcons.ImageIc,
-            ) {
-                pick.launch(androidx.activity.result.PickVisualMediaRequest(
-                    androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia.ImageOnly))
-            }
+                navMotionKind = NavMotionKind.Pill,
+                onClick = { nav.navigateWithMotion(Routes.GALLERY) },
+            )
         }
         item(key = "dim") {
             StackedCard(height = 88.dp) {
@@ -618,34 +1033,42 @@ fun ThemeSettingsScreen(nav: NavHostController) {
             }
         }
         // ★ 2026-10-02 用户口径「浅色模式下未选择壁纸也可以设置为玻璃卡片」：
-        //   开关出现条件从「已选背景图」放宽为「已选背景图 **或** 浅色主题」——
-        //   浅色无图时 frostedGlass 走「透底轻玻璃」分支（白 72% + 高光描边），开关不再空转；
-        //   深色无图依旧固定黑色半透明兜底，开关继续隐藏（切了没有可见区别）。
-        if (bgReady || AppearancePrefs.isLight) {
-            item(key = "card_style") {
-                StackedCard(height = 66.dp) {
-                    Column(Modifier.weight(1f)) {
-                        Text("玻璃卡片", fontSize = 12.sp, color = TextPrimary, fontWeight = FontWeight.Medium)
-                        Text(
-                            when {
-                                !BackgroundStore.cardGlass -> if (bgReady) "纯黑半透明，更沉稳省电" else "纯色卡片，更沉稳省电"
-                                bgReady -> "毛玻璃取样，透出背景"
-                                else -> "轻玻璃透出页面底色（浅色主题）"
-                            },
-                            fontSize = 9.sp, color = TextSecondary,
-                        )
-                    }
-                    androidx.compose.material3.Switch(
-                        checked = BackgroundStore.cardGlass,
-                        onCheckedChange = { BackgroundStore.updateCardGlass(it) },
+        //   开关出现条件从「已选背景图」放宽为「背景图真的在画 **或** 浅色主题」——
+        //   浅色无图（或图被封面模糊顶掉）时 frostedGlass 走「透底轻玻璃」分支
+        //   （白 72% + 高光描边），开关不再空转。
+        //   （历史上这里还留着「深色无图固定黑色半透明兜底、开关继续隐藏」一条 ——
+        //     2026-10-16 已被下面那条口径取代，见下。）
+        // ★ 2026-10-07：判据用 bgLive（真的在画）而不是 bgReady（有没有）——
+        //   封面模糊主题下壁纸虽在库里却全程不露面，开关/滑杆要按真实分支显示。
+        // ★ 2026-10-16 用户口径「深色模式无壁纸的时候有默认壁纸取色当前的专辑封面底色或者
+        //   专辑封面底色模糊」：深色 + 无壁纸时**不再固定纯色兜底** —— 取样底改用当前歌曲
+        //   封面模糊成的底图（页面底本就是封面取色，封面即那台「默认壁纸」）。
+        //   于是这个开关在这两种场合都有可见区别（开 = 封面模糊玻璃卡 / 关 = 纯色卡片），
+        //   条件从「壁纸在画 或 浅色主题」放宽为**恒显示**，不再有「切了没区别所以藏起来」的场合。
+        item(key = "card_style") {
+            StackedCard(height = 66.dp) {
+                Column(Modifier.weight(1f)) {
+                    Text("玻璃卡片", fontSize = 12.sp, color = TextPrimary, fontWeight = FontWeight.Medium)
+                    Text(
+                        when {
+                            !BackgroundStore.cardGlass -> if (bgLive) "纯黑半透明，更沉稳省电" else "纯色卡片，更沉稳省电"
+                            bgLive -> "毛玻璃取样，透出背景"
+                            AppearancePrefs.isLight -> "轻玻璃透出页面底色（浅色主题）"
+                            else -> "毛玻璃取样，透出封面模糊"
+                        },
+                        fontSize = 9.sp, color = TextSecondary,
                     )
                 }
+                androidx.compose.material3.Switch(
+                    checked = BackgroundStore.cardGlass,
+                    onCheckedChange = { BackgroundStore.updateCardGlass(it) },
+                )
             }
         }
         // ★ 2026-10-02 用户口径「玻璃卡片没法调节透明度，一起加上」：
-        //   滑杆只属于「浅色无图轻玻璃」形态 —— 有背景图时的玻璃形态控制是「卡片模糊强度」。
-        //   值越大越透（卡片越「轻」），往左拖 = 更实、文字对比更强。
-        if (!bgReady && AppearancePrefs.isLight && BackgroundStore.cardGlass) {
+        //   滑杆只属于「浅色 + 壁纸没露面」的轻玻璃形态 —— 壁纸在画时的玻璃形态
+        //   控制是「卡片模糊强度」。值越大越透（卡片越「轻」），往左拖 = 更实、文字对比更强。
+        if (!bgLive && AppearancePrefs.isLight && BackgroundStore.cardGlass) {
             item(key = "card_transparency") {
                 StackedCard(height = 88.dp) {
                     Column(Modifier.padding(horizontal = 16.dp)) {
@@ -660,9 +1083,9 @@ fun ThemeSettingsScreen(nav: NavHostController) {
                 }
             }
         }
-        // 卡片模糊滑杆只在「玻璃卡片 **且** 有背景图」时出现 ——
-        // 条件与 frostedGlass() 的分流保持一致，没可调对象时不显示。
-        if (bgReady && BackgroundStore.cardGlass) {
+        // 卡片模糊滑杆只在「玻璃卡片 **且** 壁纸真的在画」时出现 ——
+        // 条件与 frostedGlass() 的取样分支一致，没可调对象时不显示。
+        if (bgLive && BackgroundStore.cardGlass) {
             item(key = "card_blur") {
                 StackedCard(height = 88.dp) {
                     Column(Modifier.padding(horizontal = 16.dp)) {
@@ -678,44 +1101,43 @@ fun ThemeSettingsScreen(nav: NavHostController) {
             }
         }
         if (bgReady) {
-            item(key = "keep_ambient") {
-                StackedCard(height = 66.dp) {
-                    Column(Modifier.weight(1f)) {
-                        Text("播放页/歌词页保留取色", fontSize = 12.sp, color = TextPrimary, fontWeight = FontWeight.Medium)
-                        Text("这两页改用歌曲主色底，不透出背景图", fontSize = 9.sp, color = TextSecondary)
-                    }
-                    androidx.compose.material3.Switch(
-                        checked = BackgroundStore.keepAmbient,
-                        onCheckedChange = { BackgroundStore.updateKeepAmbient(it) },
-                    )
-                }
-            }
+            // 原「播放页/歌词页保留取色」开关已被上方「播放页面风格」三选一取代：
+            // 取色 = 开关打开（默认）；自定义 = 关掉开关、播放器组透出背景图。
             item(key = "reset") {
                 StackedIconCard(
                     title = "恢复默认背景",
                     subtitle = "移除自定义背景图",
                     icon = NcmIcons.Refresh,
                     iconTint = Accent,
-                ) { BackgroundStore.clear() }
+                ) {
+                    BackgroundStore.clear()
+                    // 壁纸没了「自定义」就无底可透：一并回落到取色，避免下次设了新壁纸时
+                    // 播放页风格被静默改回自定义（用户会当成 bug）
+                    if (AppearancePrefs.playStyle == PlayPageStyle.CUSTOM) {
+                        AppearancePrefs.setPlayStyle(PlayPageStyle.AMBIENT)
+                    }
+                }
             }
         }
         // ★ 2026-10-02 用户口径「主题栏目中添加歌词扫光的开关」：
-        //   放在条件块之外恒显示（扫光不依赖背景图）；关闭只停掉移动光斑，
+        //   不依赖背景图；低性能模式时隐藏，保留原扫光偏好。关闭只停掉移动光斑，
         //   聚焦行提亮（深色主题底噪）保留 —— 副标题如实写清，避免「关了还有效果」的困惑。
-        item(key = "lyric_sweep") {
-            StackedCard(height = 66.dp) {
-                Column(Modifier.weight(1f)) {
-                    Text("歌词扫光", fontSize = 12.sp, color = TextPrimary, fontWeight = FontWeight.Medium)
-                    Text(
-                        if (AppearancePrefs.lyricSweep) "白色光线随当前句扫过聚焦歌词"
-                        else "已关闭扫光，聚焦行提亮保留",
-                        fontSize = 9.sp, color = TextSecondary,
+        if (!AppearancePrefs.lowPerformanceLyrics) {
+            item(key = "lyric_sweep") {
+                StackedCard(height = 66.dp) {
+                    Column(Modifier.weight(1f)) {
+                        Text("歌词扫光", fontSize = 12.sp, color = TextPrimary, fontWeight = FontWeight.Medium)
+                        Text(
+                            if (AppearancePrefs.lyricSweep) "白色光线随当前句扫过聚焦歌词"
+                            else "已关闭扫光，聚焦行提亮保留",
+                            fontSize = 9.sp, color = TextSecondary,
+                        )
+                    }
+                    androidx.compose.material3.Switch(
+                        checked = AppearancePrefs.lyricSweep,
+                        onCheckedChange = { AppearancePrefs.setLyricSweep(it) },
                     )
                 }
-                androidx.compose.material3.Switch(
-                    checked = AppearancePrefs.lyricSweep,
-                    onCheckedChange = { AppearancePrefs.setLyricSweep(it) },
-                )
             }
         }
         item(key = "hint") {
@@ -727,6 +1149,18 @@ fun ThemeSettingsScreen(nav: NavHostController) {
                     .fillMaxWidth()
                     .padding(vertical = 10.dp),
             )
+        }
+        item(key = "low_performance_lyrics") {
+            StackedCard(height = 66.dp) {
+                Column(Modifier.weight(1f)) {
+                    Text("低性能歌词", fontSize = 12.sp, color = TextPrimary, fontWeight = FontWeight.Medium)
+                    Text("仅保留歌词基础缩放，降低渲染开销", fontSize = 9.sp, color = TextSecondary)
+                }
+                androidx.compose.material3.Switch(
+                    checked = AppearancePrefs.lowPerformanceLyrics,
+                    onCheckedChange = { AppearancePrefs.setLowPerformanceLyrics(it) },
+                )
+            }
         }
     }
 }
@@ -742,7 +1176,7 @@ private fun androidx.compose.foundation.layout.RowScope.ModeChip(
             .padding(end = 6.dp)
             .clip(RoundedCornerShape(50))
             .background(if (selected) Accent else SurfaceStrong)
-            .clickable(
+            .pressStretch().clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
             ) { onClick() }
@@ -783,7 +1217,7 @@ private fun AccentSwatch(color: Color, enabled: Boolean = true) {
                 },
                 shape = CircleShape,
             )
-            .clickable(
+            .pressStretch().clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
                 enabled = enabled,
@@ -819,7 +1253,9 @@ fun QualityScreen(nav: NavHostController) {
     val opts = listOf(
         Opt("standard", "标准", "普通音质，最省流量"),
         Opt("exhigh", "较高", "320kbps，音质更好"),
-        Opt("lossless", "无损", "FLAC 音质，需 VIP"),
+        // ★ 2026-10-18 用户口径「下载无损的格式改为 FLAC」：说明里点明是 FLAC 无损压缩，
+        //   用户下载后拿到的就是 .flac 文件（不再是有损 aac 冒充 mp3）。
+        Opt("lossless", "无损", "FLAC 无损压缩，需 VIP"),
     )
 
     Box(Modifier.fillMaxSize()) {
@@ -931,7 +1367,7 @@ fun AboutScreen(nav: NavHostController) {
                     .padding(horizontal = 16.dp, vertical = 8.dp)
                     .clip(RoundedCornerShape(50))
                     .background(SurfaceStrong)
-                    .clickable {
+                    .pressStretch().clickable {
                         // ★ 2026-10-02 用户口径「点击 GitHub 地址自动复制项目地址」：
                         //   不再尝试拉起浏览器 —— 手表上既打不开网页、粘贴场景也在手机端，
                         //   复制是最稳的一步动线。Android 10+ 后台读剪贴板受限，但这里写剪贴板
@@ -950,6 +1386,9 @@ fun AboutScreen(nav: NavHostController) {
                 Icon(NcmIcons.ChevronRight, contentDescription = null, tint = TextSecondary, modifier = Modifier.size(14.dp))
             }
         }
+        item(key = "update") {
+            CheckUpdateItem()
+        }
         item(key = "note") {
             Text(
                 "本应用为非官方第三方客户端\n仅供学习交流 · GPL-3.0 开源",
@@ -958,5 +1397,85 @@ fun AboutScreen(nav: NavHostController) {
                 modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
             )
         }
+    }
+}
+
+/**
+ * 检查更新入口（2026-10-02 用户口径「关于应用里加个检查更新」）。
+ *
+ * 与播放页顶部更新胶囊共用同一套 [UpdateFlow] 状态机与 [UpdateAvailableDialog] 弹窗：
+ * 空闲 → 检查中 →（已是最新 Toast ｜ 发现新版本弹窗 → 下载中 → 校验 + 自动拉起安装器）。
+ * 下载/换源/授权续装全在状态机里跑，本行只读状态显示副标题。UI 样式复刻同页「GitHub 项目地址」行。
+ */
+@Composable
+private fun CheckUpdateItem() {
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    var checking by remember { mutableStateOf(false) }
+    var found by remember { mutableStateOf<UpdateInfo?>(null) }
+    val flowState by UpdateFlow.state.collectAsState()
+    val installedVersionName = remember {
+        runCatching {
+            ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName
+        }.getOrNull() ?: "未知"
+    }
+
+    fun toast(msg: String) =
+        android.widget.Toast.makeText(ctx, msg, android.widget.Toast.LENGTH_SHORT).show()
+
+    if (found != null) {
+        val info = found ?: return
+        UpdateAvailableDialog(
+            info = info,
+            installedVersionName = installedVersionName,
+            onStart = { UpdateFlow.start(ctx, info) },
+            onInstallNow = { UpdateFlow.installLocal(ctx) },
+            onOpenPermission = { UpdateFlow.gotoInstallPermission(ctx) },
+            onDismiss = { found = null },
+        )
+    }
+
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 8.dp)
+            .clip(RoundedCornerShape(50))
+            .background(SurfaceStrong)
+            .pressStretch().clickable {
+                if (checking) return@clickable
+                // 已发现新版本（含下载中/待授权）：直接开弹窗，不重复检查
+                val known = UpdateChecker.available.value
+                if (known != null) {
+                    found = known
+                    return@clickable
+                }
+                checking = true
+                scope.launch {
+                    when (val r = UpdateChecker.checkPublish(ctx)) {
+                        is UpdateChecker.Outcome.Available -> found = r.info
+                        UpdateChecker.Outcome.UpToDate -> toast("已是最新版本 v$installedVersionName")
+                        is UpdateChecker.Outcome.Error -> toast("检查失败：${r.message}")
+                    }
+                    checking = false
+                }
+            }
+            .padding(horizontal = 13.dp, vertical = 8.dp),
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text("检查更新", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = TextPrimary)
+            Text(
+                when (val st = flowState) {
+                    is UpdateFlow.State.Downloading -> "下载中 ${st.percent}%（失败自动换源）"
+                    is UpdateFlow.State.Installing -> "正在安装 v${st.versionName}"
+                    is UpdateFlow.State.NeedPermission -> "待授权 · 点此继续"
+                    is UpdateFlow.State.Failed -> "更新失败 · 点此重试"
+                    UpdateFlow.State.Idle -> if (checking) "正在检查…" else "通过 GitHub 获取新版本"
+                },
+                fontSize = 8.sp, color = TextSecondary, maxLines = 1,
+            )
+        }
+        Icon(NcmIcons.ChevronRight, contentDescription = null, tint = TextSecondary, modifier = Modifier.size(14.dp))
     }
 }

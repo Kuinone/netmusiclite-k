@@ -34,10 +34,21 @@ import java.util.concurrent.Executors
  * `ProfileInstallerInitializer` 的 provider 声明，dex 里虽然还有类，但**这是靠 AAR 的
  * 组件声明兜住的**；显式引用后这条链路不再依赖合并结果，更稳。
  */
-class NetMusicLiteApp : Application() {
+class WmusicApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        // ★ 2026-10-18 崩溃日志（用户口径「自动记录导出到 download」）：
+        //   必须是 onCreate 的第一件事 —— 越早装 handler，越能兜住启动期（provision/取色/
+        //   profile 安装）阶段的崩溃；记录本身只写文件 + 走 MediaStore，不阻塞 UI。
+        com.netmusiclite.data.CrashLogger.init(this)
+        // ★ 2026-10-24 实验性手势操控（前台 ACC+GYRO 自研识别，默认关闭）：
+        //   这里只登记偏好和 Activity 生命周期，不注册传感器；
+        //   必须在 setContent 之前完成，设置页的开关状态才和实际运行状态一致。
+        com.netmusiclite.data.GesturePrefs.init(this)
+        com.netmusiclite.data.GestureControl.init(this)
+        // 本地歌曲内嵌封面提取（MediaMetadataRetriever → filesDir/covers_local 缓存）。
+        com.netmusiclite.data.LocalCoverStore.init(this)
         // 幂等 + 只做后台 IO，失败不影响启动（profile 缺失最多只是首次稍慢）。
         //
         // ⚠ 必须用**三参数**重载：单参数的 writeProfile(Context) 内部用 Runnable::run
@@ -55,5 +66,6 @@ class NetMusicLiteApp : Application() {
                 },
             )
         }
+        com.netmusiclite.data.CrashLogger.step("app.ready")
     }
 }

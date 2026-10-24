@@ -1,5 +1,9 @@
 package com.netmusiclite.ui.screens.listen
 
+import com.netmusiclite.ui.m3e.m3eSwipeLeft
+import com.netmusiclite.ui.m3e.adaptiveAnimateScrollToItem
+import com.netmusiclite.ui.m3e.adaptiveScrollToItem
+
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -30,7 +34,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.lazy.LazyColumn
+import com.netmusiclite.ui.m3e.AdaptiveLazyColumn as LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -47,6 +51,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -87,6 +92,7 @@ import com.netmusiclite.ui.components.EdgeProgressRing
 import com.netmusiclite.ui.components.NcmIcons
 import com.netmusiclite.ui.components.NcmToast
 import com.netmusiclite.ui.components.Pressable
+import com.netmusiclite.ui.components.pressStretch
 import com.netmusiclite.ui.components.RotatingCover
 import com.netmusiclite.ui.components.StackedCard
 import com.netmusiclite.ui.components.StackedCardList
@@ -100,6 +106,7 @@ import com.netmusiclite.ui.components.rotaryList
 import com.netmusiclite.ui.nav.Routes
 import com.netmusiclite.ui.nav.NavMotionKind
 import com.netmusiclite.ui.nav.NavMotionSpec
+import com.netmusiclite.ui.nav.OverlayBackHandler
 import com.netmusiclite.ui.nav.TransitionCoordinator
 import com.netmusiclite.ui.nav.navigateWithMotion
 import com.netmusiclite.ui.theme.Accent
@@ -183,27 +190,38 @@ object ListenChatStore {
         val replyToText: String = "",
     )
 
-    private const val MARK = "[一起听]"
-
     private val list = mutableStateListOf<Msg>()
-    private val seenIds = HashSet<Long>()
     /** 历史去重键（`uid_sendTime`，两个读通道同构 → 跨通道天然去重） */
     private val seenRoomKeys = HashSet<String>()
-    private var roomLastStamp = 0L              // middle/im 增量游标（最后一条 sendTime）
     /** 房内公共聊天通道连续未命中的轮数：连续 3 轮空则本轮会话不再探测（省请求） */
     private var roomHistMiss = 0
     private var roomChatDead = false
 
     fun messages(): List<Msg> = list
     fun clear() {
-        list.clear(); seenIds.clear()
-        seenRoomKeys.clear(); roomLastStamp = 0L
+        list.clear()
+        seenRoomKeys.clear()
         roomHistMiss = 0; roomChatDead = false
         runCatching { NcmApi.resetRoomChatProbe() }
     }
 
     /** 系统提示：加入/退出/远端切歌等，居中灰字 */
     fun system(text: String) = list.add(Msg(text, false, true))
+
+    /**
+     * 面板空态文案 —— 区分「真没人说话」和「通道没打通」。
+     * 2026-10-24：房内通道究竟哪一条对当前房型有效还在探测期，只写「还没有消息」
+     * 会让用户以为是自己没发出去；把判死状态摊到界面上，一眼知道下一步该看哪里。
+     */
+    fun emptyHint(): String = when {
+        roomChatDead && NcmApi.chatRoomHistoryDead ->
+            "两条房内通道都被服务端拒了\n（发言不会上屏 · logcat tag=LTDiag 有 crMsgSend/roomRecv）"
+        roomChatDead && ListenSession.chatRoomId == null ->
+            "拿不到云信聊天室 id\n房内消息通道没建立 · 请退出重开一次房间"
+        ListenSession.isFltRoom ->
+            "还没有消息\n这里显示乐迷团房的公共聊天\n（含官方客户端用户的发言）"
+        else -> "还没有消息\n公共聊天与云信聊天室各 8 秒拉一轮\n（含官方客户端用户的发言）"
+    }
 
     /** 消息上限：只留最近 200 条，避免长时间挂机把列表撑爆（去重集合不裁，裁了会重复上屏） */
     private fun trim() {
@@ -217,6 +235,15 @@ object ListenChatStore {
         val name = replyTo.senderName.ifEmpty { "某人" }
         return if (snippet.isEmpty()) "回复 @$name" else "回复 @$name：$snippet"
     }
+
+    /**
+     * 房内**信令**的展示口径：`点歌：歌名 - 歌手 [WM#123]` 尾巴上的 `[WM#id]` 是本端
+     * 房主自动接受用的机器码（[com.netmusiclite.data.ListenSession.confirmPendingAdds] 的
+     * 接力兜底）。房内通道打通后它会明文出现在聊天里 —— 这里只从显示文本去掉，
+     * 房主端 watcher 读的是接口原文，不受影响。
+     */
+    private fun stripSignal(text: String): String =
+        text.replace(Regex("""\s*\[WM#\d+]"""), "").trim()
 
     /**
      * [quotePrefix] 的逆运算：把服务端回读的正文前缀还原成结构化引用。
@@ -240,10 +267,14 @@ object ListenChatStore {
     }
 
     /**
-     * 发送。**只走房内公共消息通道，不再有任何私信兜底**（2026-10-01 修订）：
-     * ① 房内消息通道 `middle/im/chatroom/send` / `chatroom/special/send`（官方 dex 实证路径与参数），
-     *    真机已确认可达（返回业务码而非 404）；命中即成功；
-     * ② 未命中时把服务端 code 如实上屏 —— 旧版普通房会「逐个成员发私信」兜底，
+     * 发送。**只走房内公共消息通道，不再有任何私信兜底**（2026-10-01 修订；
+     * 2026-10-24 补上云信聊天室直发）：
+     * ① 云信聊天室直发 `eapi/room/chat/sendMsg`（带 chatRoomId + 云信 token/accid）——
+     *    真机确证双人房的发言就在云信聊天室里（`multi/special/msg/history` 对双人房恒空），
+     *    旧版只打官方那两条 `middle/im/chatroom` 系路由（恒 301），所以一句也发不出去；
+     * ② 官方 dex 实证的 `middle/im/chatroom/send` / `chatroom/special/send` 探测
+     *    （乐迷团/直播系房间走这套）；
+     * ③ 两条都不通才把失败原因如实上屏。旧版普通房这里会「逐个成员发私信」兜底，
      *    导致房间内发言变成私聊刷屏（用户反馈「房间内发消息发到私信去了」），已整体移除。
      *
      * [replyTo] 非空 = 引用回复房内公共聊天里的某条消息：正文前置一行
@@ -263,120 +294,71 @@ object ListenChatStore {
         )
         list.add(echo)
         val rid = ListenSession.roomId
-
-        // ① 房内消息通道（官方 dex 实证路径 + 参数结构；引用字段一并上报）
-        var failCode: Int? = null
+        val ref = quoted?.let {
+            NcmApi.RoomMsgRef(
+                // 房内通道没下发 serverMsgId 时 id 存的是时间戳（>1e12），不能当 msgId 上报
+                msgId = when {
+                    it.serverMsgId > 0L -> it.serverMsgId
+                    it.id in 1..999_999_999_999L -> it.id
+                    else -> 0L
+                },
+                uid = it.senderUid,
+                nickname = it.senderName,
+                text = it.text,
+            )
+        }
         if (rid != null) {
-            val code = runCatching {
-                NcmApi.ltRoomMsgSend(
-                    rid, ListenSession.chatRoomId, sendText, ListenSession.roomType,
-                    quoted?.let {
-                        NcmApi.RoomMsgRef(
-                            // 房内通道没下发 serverMsgId 时 id 存的是时间戳（>1e12），不能当 msgId 上报
-                            msgId = when {
-                                it.serverMsgId > 0L -> it.serverMsgId
-                                it.id in 1..999_999_999_999L -> it.id
-                                else -> 0L
-                            },
-                            uid = it.senderUid,
-                            nickname = it.senderName,
-                            text = it.text,
-                        )
-                    },
-                )
-            }.getOrNull()
-            if (code != null && code == 200) {
+            // 引用时 chatRoomId 可能还没下发（status 恢复会话那一拍）：向中间层要一次
+            val cr = ListenSession.chatRoomId
+                ?: runCatching { NcmApi.resolveChatRoomId(rid) }.getOrNull()
+            val code = runCatching { NcmApi.ltChatroomMsgSend(cr.orEmpty(), rid, sendText, ref) }.getOrNull()
+                ?: runCatching {
+                    NcmApi.ltRoomMsgSend(rid, cr, sendText, ListenSession.roomType, ref)
+                }.getOrNull()
+            if (code == 200) {
                 trim()
                 runCatching { refreshRoomHistory() } // 服务端回执后转正，去掉待确认半透明态
                 return true
             }
-            failCode = code
         }
 
-        // ② 房内通道没命中：**不再退私信**（2026-10-01 用户明确要求「非私聊」）。
-        //    旧版普通房会逐个成员发私信，于是「房间内发言」变成私聊刷屏 —— 已移除。
-        //    这里只做一件事：把失败原因如实上屏，方便定位（407 = 消息类型/内容被拦，
-        //    -1 = 空 body 网关拒绝，null = 全部候选组合未命中）。
+        // 房内通道没命中：**不再退私信**（2026-10-01 用户明确要求「非私聊」）。
+        // 这里只做一件事：把失败原因如实上屏，方便定位（407 = 消息类型/内容被拦，
+        // -1 = 空 body 网关拒绝，null = 全部候选组合未命中）。
         list.remove(echo)
         system(
             when {
-                failCode == null -> "房内消息未发出：房内通道不可达（房间可能已结束或服务端限流）"
-                failCode == 407 -> "房内消息未发出：内容被服务端拦截（code 407）"
-                failCode == -1 -> "房内消息未发出：服务端拒绝了请求（网关空响应）"
-                else -> "房内消息未发出（code=$failCode）"
+                rid == null -> "房内消息未发出：当前不在房间里"
+                else -> "房内消息未发出：两条房内通道都没接受这条消息（详见 logcat tag=LTDiag 的 crMsgSend / roomMsgSend）"
             }
         )
         return false
     }
 
     /**
-     * 接收（普通房的私信桥接通道）：逐成员拉私信历史合并进列表（按 id 去重）。
-     * includeBeforeJoin = 拉本次进房之前的历史（limit 50、不按进房时间截断）——
-     * 聊天面板首次打开时用，更早的桥接消息与本次会话之间由 UI 画分隔线。
-     *
-     * 乐迷团房直接跳过：成员取自全站 topUsers，不是熟人 —— 不拉他们的私信历史，
-     * 也不给他们发私信（骚扰 + 风控风险）。乐迷团房的聊天只走 [refreshRoomHistory]。
-     */
-    suspend fun refresh(includeBeforeJoin: Boolean = false) {
-        if (!ListenSession.active) return
-        if (ListenSession.isFltRoom) return
-        val startMs = ListenSession.sessionStartWallMs
-        if (startMs <= 0L) return
-        val me = SessionStore.uid
-        val peers = ListenSession.members.filter { it.id > 0L && it.id != me }
-        if (peers.isEmpty()) return
-        var added = false
-        peers.forEach { m ->
-            val hist = runCatching { NcmApi.msgHistory(m.id, limit = if (includeBeforeJoin) 50 else 20) }.getOrNull()
-                ?: return@forEach
-            hist.forEach { h ->
-                if (h.id <= 0L || h.id in seenIds) return@forEach
-                if (!includeBeforeJoin && h.timeMs < startMs) return@forEach
-                val body = h.text.trim()
-                // 歌曲卡片/图片/不支持消息不进房间聊天
-                if (body.isEmpty() || h.song != null || body == "[图片]" || body == "[不支持的消息]") return@forEach
-                seenIds.add(h.id)
-                list.add(Msg(
-                    text = body.removePrefix(MARK).trim(),
-                    isMe = h.fromMe,
-                    id = h.id,
-                    timeMs = h.timeMs,
-                    senderName = if (h.fromMe) "" else m.name,
-                    senderUid = if (h.fromMe) 0L else m.id,
-                    serverMsgId = h.id,
-                ))
-                added = true
-            }
-        }
-        if (!added) return
-        // 服务端已回执的己方消息 → 清掉同文案的本地待确认气泡
-        val mineDelivered = list.filter { !it.isSystem && it.id > 0L && it.isMe }
-            .map { it.text }.toHashSet()
-        if (mineDelivered.isNotEmpty()) {
-            list.removeAll { !it.isSystem && it.id == 0L && it.isMe && it.text in mineDelivered }
-        }
-        list.sortBy { it.timeMs }
-    }
-
-    /**
      * 收：**房内公共聊天**（唯一权威通道，含进房前历史、系统提示、他人发言）。
      *
-     * ① `listen/together/multi/special/msg/history`（官方 `Lad0/v;->e`，主通道）——
-     *    参数硬约束 size=50 / direction=0，命中即拿到最近一页公共聊天。
-     * ② `middle/im/chatroom/msg/history/query`（歌房通道，仅在①无结果时作为补充）——
-     *    对乐迷团/SELFHOST 房是网关级 400 空 body，NcmApi 内部连续 2 轮全空后自动判死，
-     *    不再每 8s 白打 9 个请求。
+     * 两个通道**每拍都读**（2026-10-24 修订，直接决定「能不能收到对方消息」）：
+     * ① `listen/together/multi/special/msg/history`（官方 `Lad0/v;->e`）——
+     *    参数硬约束 size=50 / direction=0。真机确证：**双人房这一路恒空**
+     *    （1.35 日志 `roomChatHist#1 n=0`），它是乐迷团/SELFHOST 房才有的通道。
+     * ② `middle/im/chatroom/msg/history/query`（云信聊天室）——
+     *    双人房的房内发言真正落在 `roomInfo.chatRoomId` 那个聊天室里。
      *
-     * 旧版两个致命缺陷（本次修复）：
-     * - `middleHit = recs.isNotEmpty() || roomLastStamp > 0L || first`：首轮 `first` 恒为 true
-     *   → `middleHit` 恒真 → 下面的 multi 兜底被 `if (!middleHit)` 直接短路，**兜底从来没跑过**；
-     * - 兜底里读的是 `serverMsgId`（响应里根本没有这个键，id 在 `serverExt.msgId`）
-     *   → 即便跑到了也会把每条记录当 `id<=0` 丢弃。
+     * 旧版把②写成 `if (!hit)` 的兜底：只要①回了**任何**一条（哪怕只是「XX 加入了房间」
+     * 这种系统提示），②就永远不查 —— 双人房于是「收不到对方发的消息」。
+     * 现在两路并行，跨通道按 `uid_sendTime` 去重（两路同构，天然不会重影），
+     * 各自的判死逻辑（multi 连续 3 轮空 / middle/im 连续 2 轮 3 通道全空）仍然省请求。
+     *
+     * ★ 2026-10-24 同时**删除私信桥接接收**（旧的 `refresh()`：逐成员拉私信历史灌进房间列表）。
+     *   那是「歌房消息通道和个人私信混用」的根因 —— 房间面板里会冒出这对好友几个月前
+     *   的私聊记录，而真正的房内发言一条也没有。发送侧早在 2026-10-01 就不退私信了，
+     *   接收侧当时没跟着删。私信只属于私信页，房间聊天只属于房间通道。
      */
     suspend fun refreshRoomHistory() {
         val rid = ListenSession.roomId ?: return
         val me = SessionStore.uid
-        var hit = false
+        var added = 0
 
         // ① 房内公共聊天（官方 LT multi 通道）
         if (!roomChatDead) {
@@ -389,7 +371,7 @@ object ListenChatStore {
                 seenRoomKeys.add(m.key)
                 val q = normalizeQuote(m.text)
                 list.add(Msg(
-                    text = q.third,
+                    text = stripSignal(q.third),
                     isMe = !m.isSystem && m.uid == me,
                     isSystem = m.isSystem,
                     // id 非零 = 已确认的房内消息（不参与本地待确认气泡逻辑）
@@ -401,15 +383,20 @@ object ListenChatStore {
                     replyToName = q.first,
                     replyToText = q.second,
                 ))
-                hit = true
+                added++
             }
         }
 
-        // ② 歌房聊天室通道（补充；普通房若有发言会在这里，乐迷团房为空/已判死）
+        // ② 云信聊天室通道 —— 双人房的发言只有这里会有。
+        //    chatRoomId 未下发时（status 恢复会话那一拍）向中间层要一次，别整条通道空转。
+        //    请求参数按官方 dex 口径（2026-10-24）：timeStamp 传**当前时间**、limit=100
+        //    拉最近一页（传 0 会被当成「epoch 之前」，服务端回 data {}，什么都收不到）；
+        //    增量靠 uid_sendTime 去重。
         val chatRoomId = ListenSession.chatRoomId
-        if (!hit && chatRoomId != null) {
+            ?: runCatching { NcmApi.resolveChatRoomId(rid) }.getOrNull()
+        if (chatRoomId != null) {
             val recs = runCatching {
-                NcmApi.chatRoomHistory(chatRoomId, rid, roomLastStamp, 50, reverse = roomLastStamp == 0L)
+                NcmApi.chatRoomHistory(chatRoomId, rid)
             }.getOrDefault(emptyList())
             recs.forEach { r ->
                 val ext = r.optJSONObject("serverExt")
@@ -421,10 +408,9 @@ object ListenChatStore {
                 val key = "${uid}_$t"
                 if (key in seenRoomKeys) return@forEach
                 seenRoomKeys.add(key)
-                if (t > roomLastStamp) roomLastStamp = t
                 val q = normalizeQuote(text)
                 list.add(Msg(
-                    text = q.third,
+                    text = stripSignal(q.third),
                     isMe = uid == me,
                     id = t,
                     timeMs = t,
@@ -433,11 +419,20 @@ object ListenChatStore {
                     replyToName = q.first,
                     replyToText = q.second,
                 ))
-                hit = true
+                added++
             }
+        } else {
+            android.util.Log.i("LTDiag", "roomRecv noChatRoom roomId=$rid")
         }
-
-        if (!hit) return
+        if (added > 0) {
+            // 「收不到消息」先看这行：n=本轮新增、cr=聊天室 id、multiDead/imDead=两路判死状态
+            android.util.Log.i(
+                "LTDiag",
+                "roomRecv n=$added total=${list.size} cr=$chatRoomId multiDead=$roomChatDead",
+            )
+        }
+        // 一条都没新增时不必重排/清理（列表已经是有序的），省掉每拍两次全表遍历
+        if (added == 0 && list.isNotEmpty()) return
         list.sortBy { it.timeMs }
         // 走房内通道发出的消息：服务端回执后撤掉本地待确认气泡（否则同一句话会重影两条：
         // 一条半透明的 id=0 回显 + 一条服务端回读的正式消息）。
@@ -551,7 +546,9 @@ fun ListenTogetherScreen(nav: NavHostController) {
             titleSubtitle = when {
                 searchingMode -> "搜索乐迷团一起听"
                 ListenSession.fltMode -> "乐迷团房 · ${ListenSession.fltTitle.ifEmpty { "已加入" }}"
-                inRoom -> "房间 ${roomTail()}"
+                // ★ 2026-10-23 用户口径「把开房间后带有尾号相关字样显示删掉，容易被误会是
+                //   房间号」：标题副标题不再显示任何房号/尾号，只说"已在房间中"和在线人数。
+                inRoom -> "已在房间中 · ${peopleText()}"
                 else -> "和好友同步听歌"
             },
             progressTotal = if (searchingMode) (if (fltArtists.isEmpty()) 1 else fltArtists.size) else cardCount,
@@ -571,10 +568,12 @@ fun ListenTogetherScreen(nav: NavHostController) {
                         .clip(RoundedCornerShape(50))
                         .background(SurfaceGlass)
                         .padding(horizontal = 14.dp, vertical = 8.dp),
+                    // ★ 2026-10-24 用户需求：搜索框恢复「搜点什么」占位（单行，不改变框高）。
                     decorationBox = { inner ->
                         Box(Modifier.fillMaxWidth()) {
-                            if (fltQuery.text.isEmpty())
-                                Text("搜索艺人 · 查是否正在一起听", fontSize = 10.sp, color = TextSecondary)
+                            if (fltQuery.text.isEmpty()) {
+                                Text("搜点什么", fontSize = 11.sp, color = TextSecondary)
+                            }
                             inner()
                         }
                     },
@@ -639,7 +638,9 @@ fun ListenTogetherScreen(nav: NavHostController) {
                     item(key = "room", contentType = "listen") {
                         StackedIconCard(
                             title = "回到房间",
-                            subtitle = "尾号 ${roomTail()} · ${peopleText()}",
+                            // ★ 2026-10-23 用户口径「把开房间后带有尾号相关字样显示删掉，
+                            //   容易被误会是房间号」：副标题只显示在线人数，不再出现「尾号 xxxx」。
+                            subtitle = peopleText(),
                             icon = NcmIcons.Together,
                             iconTint = Accent,
                             iconBg = Accent.copy(alpha = 0.20f),
@@ -689,7 +690,7 @@ fun ListenTogetherScreen(nav: NavHostController) {
         if (showJoin) {
             TextInputDialog(
                 title = "加入一起听",
-                placeholder = "粘贴邀请链接或房号",
+                // ★ 2026-10-23 需求③：不再传框内占位文案（用户口径「所有输入框占位全部删除」）。
                 onConfirm = { code ->
                     showJoin = false
                     if (!busy) {
@@ -712,11 +713,13 @@ fun ListenTogetherScreen(nav: NavHostController) {
     }
 }
 
-@Composable
-private fun roomTail(): String {
-    val id = ListenSession.roomId ?: return "—"
-    return if (id.contains('_')) id.substringAfterLast('_').takeLast(4) else id.takeLast(4)
-}
+// ★ 2026-10-23：这里原先有个 roomTail()（取 roomId 尾 4 位，在入口页标题与「回到房间」卡上
+//   显示「房间 xxxx / 尾号 xxxx」）。用户口径「带有尾号相关字样容易被误会是房间号」——
+//   现在房号/尾号**完全不上屏**，该函数已删除：
+//   · 「回到房间」卡副标题只显示在线人数；
+//   · 入口页标题只显示「已在房间中 · N 人」。
+//   房号校验本身（ListenSession.validRoomId / establish 失败不进房间态）保留不动 ——
+//   它负责"没拿到服务端真房号就不进入房间态"，与显示无关。
 
 /**
  * 一起听各浮层（房间歌单 / 添加歌曲 / 邀请好友 / 成员名单）的底色。
@@ -762,8 +765,9 @@ fun ListenRoomScreen(nav: NavHostController) {
     val swipePx = with(androidx.compose.ui.platform.LocalDensity.current) { 34.dp.toPx() }
     val backFader = remember(swipePx) { SwipeBackFader(swipePx, scope) }
     // 滑出目标 = 屏宽（松手速度接续滑出用）
+    // ⚠ screenWidthUiDp = UI 坐标系屏宽（密度等比缩放后 LocalConfiguration.screenWidthDp 不再等于屏宽）
     val screenPx = with(androidx.compose.ui.platform.LocalDensity.current) {
-        androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp.dp.toPx()
+        com.netmusiclite.ui.components.screenWidthUiDp().toPx()
     }
     var swipeLifted by remember { mutableStateOf(false) } // 右滑期间置顶，退出时下层接场无空白帧
     val clipboard = LocalClipboardManager.current
@@ -771,19 +775,80 @@ fun ListenRoomScreen(nav: NavHostController) {
     val playing = PlayerEngine.isPlaying
 
     LaunchedEffect(Unit) {
+        // ★ 2026-10-18 耗电：改成状态订阅，不再每 500ms 轮询。
+        //   ListenSession.active 本身就是 Compose 状态，snapshotFlow 只在它真正翻转时发一次
+        //   事件 —— 旧版在房间页停留期间每 0.5s 唤醒一次 CPU，只为读一个 boolean。
+        //   语义不变：仍然要求「先 true 后 false」才触发，进入页面时已结束的房间不会误弹。
         var wasActive = ListenSession.active
-        while (true) {
-            delay(500)
-            if (wasActive && !ListenSession.active) {
+        snapshotFlow { ListenSession.active }.collect { now ->
+            if (wasActive && !now) {
                 toast = ListenSession.statusText.ifEmpty { "房间已结束" }
                 delay(1400)
                 nav.popBackStack()
-                return@LaunchedEffect
             }
-            wasActive = ListenSession.active
+            wasActive = now
         }
     }
     LaunchedEffect(toast) { if (toast != null) { delay(2200); toast = null } }
+
+    // ---------- 一起听内收藏（2026-10-23 新增，修「一起听收藏不可用」） ----------
+    // 本端在途的收藏 id：写请求期间挡掉重复点击。引擎里也有 pendingLike 互斥，
+    // 但被它忽略的那次点击本页的 toast 已经说出去了，会出现「提示成功其实没写」的假象。
+    var likingIds by remember { mutableStateOf<Set<Long>>(emptySet()) }
+    // 每首歌最后一次收藏操作的序号：异步校对结果时只认最后一次，避免连点误报失败
+    var likeSeq by remember { mutableStateOf(0) }
+    val likeSeqBySong = remember { mutableMapOf<Long, Int>() }
+
+    /**
+     * 房间歌单 → 收藏 / 取消收藏（**写接口**：`NcmApi.likeSong`，经 [PlayerEngine.toggleLike]）。
+     *
+     * 根因背景（「一起听收藏不可用」）：本文件一起听域旧版**没有任何收藏调用**
+     * （grep 只有三处注释提到「收藏」），房间歌单里长按的手势实际是「从房间歌单删除」——
+     * 用户在房间里想收藏，唯一能按到的长按反而把歌删了，反馈就成了「收藏点了没反应/收藏不了」。
+     * 现补上真正落到网易云账号的收藏入口（长按 → 操作浮层 → 收藏/取消收藏）。
+     *
+     * 防静默三件事：
+     *  ① 未登录明确提示（[NcmApi.likeSong] 在 uid=0 时会拒绝写匿名收藏，旧链路没人告诉用户）；
+     *  ② 本地歌曲 / 坏 id 明确提示；
+     *  ③ 乐观更新后等写请求落地再校对一次红心，失败回滚时把「静默回滚」变成可见提示。
+     */
+    fun toggleRoomLike(s: Song) {
+        if (!SessionStore.loggedIn) {
+            toast = "未登录，无法收藏"
+            return
+        }
+        if (s.id <= 0L) {
+            toast = "该歌曲不支持收藏"
+            return
+        }
+        // ★ 2026-10-24（用户反馈「点第一下显示收藏处理中，要点第二下才真正收藏」）：
+        //   在途时**静默忽略**，不再覆盖 toast。旧版在这里写「收藏处理中，请稍候」——
+        //   当同一点击被两个手势层/两个入口各触发一次时（第二次命中的是这里的在途拦截），
+        //   用户看到的就是「第一下说处理中、第二下才生效」，误以为第一次没执行。
+        //   实际第一次已乐观更新并发起写入，第二次本就应该被丢弃（防 like/unlike 交错）。
+        if (s.id in likingIds) return
+        val want = !PlayerEngine.isLiked(s.id)
+        val seq = ++likeSeq
+        likeSeqBySong[s.id] = seq
+        likingIds = likingIds + s.id
+        // 乐观更新 + 风控互斥 + 失败回滚都在引擎内（PlayerEngine.toggleLike）
+        PlayerEngine.toggleLike(s)
+        toast = if (want) "已收藏 · ${s.title}" else "已取消收藏 · ${s.title}"
+        scope.launch {
+            // ★ 写请求失败在引擎里是**静默回滚**（只回滚红心、不通知 UI）。
+            //   一起听域刚补上收藏入口，必须把失败摆到界面上：
+            //   等写请求落地后校对一次红心，与用户意图不一致就明确提示。
+            try {
+                delay(2000L)
+            } finally {
+                likingIds = likingIds - s.id
+            }
+            if (likeSeqBySong[s.id] != seq) return@launch // 期间又点过这首歌：以最新一次为准
+            if (PlayerEngine.isLiked(s.id) != want) {
+                toast = "收藏失败 · 请检查网络或重新登录后再试"
+            }
+        }
+    }
 
     Box(
         Modifier
@@ -794,8 +859,14 @@ fun ListenRoomScreen(nav: NavHostController) {
                 translationX = backFader.slidePx
                 scaleX = backFader.scale
                 scaleY = backFader.scale
+                // 2026-10-02：缩放圆心 = 本页入场时的点击位置（原路返回）
+                transformOrigin = backFader.origin
             }
-            .pointerInput(Unit) {
+            .m3eSwipeLeft(if (com.netmusiclite.data.AppearancePrefs.isM3e && mode == "room") ({
+                nav.navigateWithMotion(Routes.LYRICS, NavMotionSpec(NavMotionKind.Slide))
+            }) else null)
+            .pointerInput(com.netmusiclite.data.AppearancePrefs.isM3e, mode) {
+                if (com.netmusiclite.data.AppearancePrefs.isM3e && mode == "room") return@pointerInput
                 val px = 70.dp.toPx()
                 var totalX = 0f
                 var leftX = 0f
@@ -840,6 +911,10 @@ fun ListenRoomScreen(nav: NavHostController) {
                 ) { change, amount -> change.consume(); totalY += amount }
             },
     ) {
+        // 默认主题背景由 AppRoot 全局层负责；m3e 仍由页面自带。
+        if (com.netmusiclite.data.AppearancePrefs.isM3e) {
+            com.netmusiclite.ui.components.NcmBackground(route = Routes.LISTEN_ROOM, prepareResources = false)
+        }
         AnimatedContent(
             targetState = mode,
             transitionSpec = {
@@ -857,18 +932,28 @@ fun ListenRoomScreen(nav: NavHostController) {
                 RoomPanel(
                     song = song,
                     playing = playing,
+                    // ★ 2026-10-23：收藏态从引擎红心集合反查（PlayerEngine.likedIds 是
+                    //   mutableStateOf，读它即建立快照订阅，收藏落地/失败回滚会自动重组）。
+                    liked = song != null && PlayerEngine.isLiked(song.id),
+                    onToggleLike = { song?.let { toggleRoomLike(it) } },
                     onOpenInvite = { showInvite = true },
                     onOpenQueue = { showQueue = true },
                     onOpenMembers = { showMembers = true },
+                    onOpenChat = { mode = "chat" },
                     onVolume = {
-                        // 唤出系统音量调节面板（STREAM_MUSIC，与播放页音量钮同规格）
-                        val am = ctx.getSystemService(android.content.Context.AUDIO_SERVICE)
-                            as android.media.AudioManager
-                        am.adjustStreamVolume(
-                            android.media.AudioManager.STREAM_MUSIC,
-                            android.media.AudioManager.ADJUST_SAME,
-                            android.media.AudioManager.FLAG_SHOW_UI,
-                        )
+                        if (com.netmusiclite.data.DeviceCompat.useInAppVolume) {
+                            // 非 ColorOS：自绘音量条（与播放页同规格，2026-10-03 扩到非 ColorOS 全机型）
+                            com.netmusiclite.ui.components.InAppVolume.show()
+                        } else {
+                            // 唤出系统音量调节面板（STREAM_MUSIC，与播放页音量钮同规格）
+                            val am = ctx.getSystemService(android.content.Context.AUDIO_SERVICE)
+                                as android.media.AudioManager
+                            am.adjustStreamVolume(
+                                android.media.AudioManager.STREAM_MUSIC,
+                                android.media.AudioManager.ADJUST_SAME,
+                                android.media.AudioManager.FLAG_SHOW_UI,
+                            )
+                        }
                     },
                     onExit = { askExit = true },
                 )
@@ -878,19 +963,24 @@ fun ListenRoomScreen(nav: NavHostController) {
         if (showQueue) {
             RoomQueueOverlay(
                 onDismiss = { showQueue = false },
-                // 切歌权归房主（与三键区同规则）：成员点歌单切歌会被服务端拒/同步拉回，明确提示
+                // 双人房全员可在歌单点歌（2026-10-24 用户要求）；乐迷团跟听房仍只房主
                 onPick = { i ->
-                    if (ListenSession.isHost) {
+                    if (ListenSession.canControlRoom) {
                         PlayerEngine.playAt(i)
                         showQueue = false
                     } else {
-                        toast = "仅房主可切歌"
+                        toast = "乐迷团房仅房主可切歌"
                     }
                 },
                 onAddSong = { showQueue = false; showAdd = true },
                 onPickRecommend = { s ->
-                    if (ListenSession.addToRoomQueue(s)) toast = "已加入房间歌单 · ${s.title}"
-                    else toast = "这首歌已在房间歌单里"
+                    // ★ 2026-10-23 二轮：三态（已加入 / 已在歌单 / 加入失败），
+                    //   旧版 Boolean 把「失败」和「重复」都报成「已在歌单」，用户以为加成功了。
+                    when (ListenSession.addToRoomQueueResult(s)) {
+                        ListenSession.AddResult.ADDED -> toast = "已加入房间歌单 · ${s.title}"
+                        ListenSession.AddResult.DUPLICATE -> toast = "这首歌已在房间歌单里"
+                        ListenSession.AddResult.FAILED -> toast = "加入失败（不在房间或房间已结束）"
+                    }
                 },
                 // 长按房间歌单里的某一首 → 从房间歌单删除（不是取消收藏，不动收藏数据）
                 onRemove = { i ->
@@ -901,6 +991,8 @@ fun ListenRoomScreen(nav: NavHostController) {
                         "删除失败（歌单可能已变化）"
                     }
                 },
+                // ★ 2026-10-23 新增：长按菜单里的「收藏 / 取消收藏」真正落到网易云账号
+                onToggleLike = { s -> toggleRoomLike(s) },
             )
         }
 
@@ -909,8 +1001,12 @@ fun ListenRoomScreen(nav: NavHostController) {
                 // 选完/关掉都回歌单浮层（选歌是歌单的子流程，不再两个浮层叠着渲染）
                 onDismiss = { showAdd = false; showQueue = true },
                 onPick = { s ->
-                    if (ListenSession.addToRoomQueue(s)) toast = "已加入房间歌单 · ${s.title}"
-                    else toast = "这首歌已在房间歌单里"
+                    // ★ 2026-10-23 二轮：三态 toast（同 onPickRecommend）
+                    when (ListenSession.addToRoomQueueResult(s)) {
+                        ListenSession.AddResult.ADDED -> toast = "已加入房间歌单 · ${s.title}"
+                        ListenSession.AddResult.DUPLICATE -> toast = "这首歌已在房间歌单里"
+                        ListenSession.AddResult.FAILED -> toast = "加入失败（不在房间或房间已结束）"
+                    }
                     showAdd = false
                     showQueue = true
                 },
@@ -935,6 +1031,20 @@ fun ListenRoomScreen(nav: NavHostController) {
         if (showInvite) {
             InviteFriendsOverlay(
                 onDismiss = { showInvite = false },
+                // ★ 2026-10-23 修「点分享/邀请后没有任何提示」：
+                //   复制邀请链接后**立刻**弹「邀请链接已复制」（复用本页 toast），
+                //   随后邀请结果再覆盖这条提示 —— 用户至少知道链接已经进了剪贴板。
+                onShareLink = {
+                    val link = ListenSession.shareLink()
+                    if (link == null) {
+                        // 没有服务端确认的房号时 shareLink() 返回 null：不复制空链接
+                        toast = "房间信息未就绪，暂时无法分享"
+                    } else {
+                        clipboard.setText(AnnotatedString(link))
+                        // ★ 2026-10-23：提示里不再带「尾号 xxxx」（用户口径：容易被误会是房间号）
+                        toast = "邀请链接已复制"
+                    }
+                },
                 onInvite = { f ->
                     val link = ListenSession.shareLink()
                     if (link == null) {
@@ -944,24 +1054,28 @@ fun ListenRoomScreen(nav: NavHostController) {
                         // 链接始终先复制：官方邀请接口失败时它是唯一可用路径
                         clipboard.setText(AnnotatedString(link))
                         showInvite = false
-                        val rid = ListenSession.roomId ?: "-"
+                        // ★ 复制动作必须有可见反馈（旧版只在部分分支的 toast 里提一句「链接已复制」）
+                        toast = "邀请链接已复制"
+                        // 房号只取真实值：旧版 ?: "-" 会往私信/系统消息里写「房号 -」这种假房号
+                        val rid = ListenSession.roomId.orEmpty()
+                        val ridSuffix = if (rid.isNotEmpty()) "，房间号 $rid" else ""
                         scope.launch {
                             // ① 官方一起听邀请接口（非私信）：邀请落进对方「一起听」消息箱，点一下即进房
                             when (ListenSession.invite(f.id)) {
                                 ListenSession.InviteResult.DELIVERED -> {
                                     ListenChatStore.system("已邀请 ${f.name} 一起听（对方在「一起听」页接受即可）")
-                                    toast = "已邀请 ${f.name}"
+                                    toast = "已邀请 ${f.name} · 邀请链接已复制"
                                 }
                                 // ② 邀请接口没通：退一步发私信（带房号 + 链接），并明确告知链接已复制
                                 else -> {
                                     val ok = runCatching {
-                                        NcmApi.msgSend(f.id, "我在 NetMusicLite 开了个一起听，房间号 $rid，来一起听\n$link")
+                                        NcmApi.msgSend(f.id, "我在 NetMusicLite 开了个一起听$ridSuffix，来一起听\n$link")
                                     }.getOrDefault(false)
                                     ListenChatStore.system(
-                                        if (ok) "已私信邀请 ${f.name}（房号 $rid）"
-                                        else "邀请未送达：房号 $rid，邀请链接已复制，可手动发给对方")
-                                    toast = if (ok) "已邀请 ${f.name} · 链接已复制"
-                                    else "邀请未送达 · 链接已复制"
+                                        if (ok) "已私信邀请 ${f.name}${if (rid.isNotEmpty()) "（房号 $rid）" else ""}"
+                                        else "邀请未送达：邀请链接已复制，可手动发给对方")
+                                    toast = if (ok) "已邀请 ${f.name} · 邀请链接已复制"
+                                    else "邀请未送达 · 邀请链接已复制"
                                 }
                             }
                         }
@@ -971,7 +1085,9 @@ fun ListenRoomScreen(nav: NavHostController) {
         }
 
         if (askExit) {
-            DialogScrim(onDismiss = { askExit = false }) {
+            // ★ 2026-10-24 用户需求：m3e 主题下删除本确认框最下方的「关闭」按钮
+            //   （框内已有取消/确定两颗圆钮 + 点遮罩关闭，底部关闭键重复且压屏）。
+            DialogScrim(onDismiss = { askExit = false }, m3eShowClose = false) {
                 Column(
                     Modifier
                         .fillMaxWidth()
@@ -1019,17 +1135,52 @@ fun ListenRoomScreen(nav: NavHostController) {
  * 2026-10-01：顶部「已连接 / 房主」状态胶囊（原占 4→36dp）删除，其余组件整体上移 20px（本机 10dp）：
  *   成员行 40→30 ｜ 歌名 64→54 ｜ 艺人行 54→78 ｜ 三键 112→102 ｜ 弧形钮顶 187.5（不动）
  * 侧边进度环与底部弧形状态栏**不参与**位移。
+ *
+ * 2026-10-23：新增「收藏 / 取消收藏当前歌」（[liked] / [onToggleLike]）。
+ *   经典主题落点 = 底部 [ListenArcBar] 中间那颗（弧栏 4 → 5 颗：36dp/半径 92dp/±47°，
+ *   外沿仍为 110dp，与改造前一致）；m3e 由 [M3eListenRoomPanel] 画在 song 卡片的 trailing
+ *   红心。三键区右侧放不下的几何原因见 [ListenArcBar] 的注释与 docs/LT_UI_COLLECT.md。
  */
 @Composable
 private fun RoomPanel(
     song: Song?,
     playing: Boolean,
+    /** 当前房间歌曲是否已在「我喜欢」里（红心填充态） */
+    liked: Boolean,
+    /** 收藏 / 取消收藏当前歌（复用 ListenRoomScreen.toggleRoomLike：未登录/本地歌/toast/校对都在那里） */
+    onToggleLike: () -> Unit,
     onOpenInvite: () -> Unit,
     onOpenQueue: () -> Unit,
     onOpenMembers: () -> Unit,
+    onOpenChat: () -> Unit,
     onVolume: () -> Unit,
     onExit: () -> Unit,
 ) {
+    if (com.netmusiclite.data.AppearancePrefs.isM3e) {
+        com.netmusiclite.ui.m3e.M3eListenRoomPanel(
+            song = song,
+            playing = playing,
+            liked = liked,
+            onToggleLike = onToggleLike,
+            isHost = ListenSession.isHost,
+            canControl = ListenSession.canControlRoom,
+            members = peopleText(),
+            progress = {
+                (PlayerEngine.positionMs.toFloat() / PlayerEngine.durationMs.coerceAtLeast(1L)).coerceIn(0f, 1f)
+            },
+            playbackTime = "${formatMs(PlayerEngine.positionMs)} / ${formatMs(PlayerEngine.durationMs)}",
+            onPrevious = { PlayerEngine.prev() },
+            onToggle = { PlayerEngine.toggle() },
+            onNext = { PlayerEngine.next() },
+            onMembers = onOpenMembers,
+            onChat = onOpenChat,
+            onInvite = onOpenInvite,
+            onQueue = onOpenQueue,
+            onVolume = onVolume,
+            onExit = onExit,
+        )
+        return
+    }
   Box(Modifier.fillMaxSize()) {
     // ★ 房间页进度环只作展示、不接 seek：① 播放进度由房间同步接管，本地拖动必然被
     //   远端状态拉回，徒劳；② 该手势挂 Initial 通道且「纵向趋势接管」，会把页面级
@@ -1083,23 +1234,28 @@ private fun RoomPanel(
         )
     }
 
-    // 三键区：切歌权归房主（成员点了会切到空白/被同步拉回，直接屏蔽），成员只剩播/停
+    // 三键区：双人房（非乐迷团房）**全员可切歌**（2026-10-24 用户要求，与官方一致）。
+    //   旧版按 isHost 屏蔽成员的上一首/下一首，理由「成员点了会切到空白/被同步拉回」其实
+    //   是三个同步缺陷的表象（回声误判 + 命令被门禁吞 + 心跳互相拽回），本轮已在 ListenSession 修掉。
+    //   乐迷团跟听房仍只房主可控（单向跟听，成员控歌无上报通道）。
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier.align(Alignment.TopCenter).padding(top = 112.dp - shift),
     ) {
-        if (ListenSession.isHost) {
+        if (ListenSession.canControlRoom) {
             CircleIconButton(NcmIcons.Prev, "上一首", { PlayerEngine.prev() }, size = 38.dp, iconSize = 18.dp)
             Spacer(Modifier.width(6.dp))
         }
         RoomPlayButton(playing = playing, song = song) { PlayerEngine.toggle() }
-        if (ListenSession.isHost) {
+        if (ListenSession.canControlRoom) {
             Spacer(Modifier.width(6.dp))
             CircleIconButton(NcmIcons.Next, "下一首", { PlayerEngine.next() }, size = 38.dp, iconSize = 18.dp)
         }
     }
 
     ListenArcBar(
+        liked = liked,
+        onToggleLike = onToggleLike,
         onInvite = onOpenInvite,
         onQueue = onOpenQueue,
         onVolume = onVolume,
@@ -1142,6 +1298,8 @@ private fun MemberRow(modifier: Modifier = Modifier, onClick: () -> Unit) {
  */
 @Composable
 private fun MemberOverlay(onDismiss: () -> Unit) {
+    // 系统 back（含华为式被系统吃掉的右滑）：先关本浮层，不动导航（2026-10-07 同批修复）
+    OverlayBackHandler { onDismiss() }
     val listState = rememberLazyListState()
     val members = ListenSession.members
     val creator = ListenSession.creatorId
@@ -1264,6 +1422,15 @@ private fun MemberOverlay(onDismiss: () -> Unit) {
 /** 大播放键：镂空圆环 + 内嵌旋转封面（68dp；房间页顶部多了状态+成员两行，比播放页 82dp 明显收小） */
 @Composable
 private fun RoomPlayButton(playing: Boolean, song: Song?, onClick: () -> Unit) {
+    if (com.netmusiclite.data.AppearancePrefs.isM3e) {
+        androidx.wear.compose.material3.FilledIconButton(onClick = onClick, modifier = Modifier.pressStretch().size(68.dp)) {
+            androidx.wear.compose.material3.Icon(
+                if (playing) NcmIcons.Pause else NcmIcons.Play,
+                if (playing) "暂停" else "播放",
+            )
+        }
+        return
+    }
     Pressable(onClick = onClick) {
         Box(
             Modifier
@@ -1286,28 +1453,61 @@ private fun RoomPlayButton(playing: Boolean, song: Song?, onClick: () -> Unit) {
 }
 
 /**
- * 底部弧形操作区（带高 40dp / 中心半径 88dp / 弧段 90°±45°）。
- * 四钮（30° 间距、44dp）：左→右 邀请好友｜房间歌单｜音量｜退出。
+ * 底部弧形操作区（带高 40dp / 中心半径 92dp / 弧段 94°±47°）。
+ * 五钮（23.5° 间距、36dp）：左→右 邀请好友｜房间歌单｜收藏当前歌｜音量｜退出。
  * 音量 = 唤出系统音量面板（STREAM_MUSIC，与播放页音量钮同规格）。
+ *
+ * ★ 2026-10-23 新增「收藏 / 取消收藏当前歌」。
+ *
+ * 【为什么放在底部弧而不是三键区右侧】
+ *   466×466 @density2.0（1dp=2px，屏 233dp，圆心 (116.5,116.5)，圆半径 116.5dp）实测：
+ *   ① 房主态三键区 = prev 38 + 6 + play 68 + 6 + next 38 = 156dp，居中后占 x 38.5..194.5；
+ *      右侧 3 点钟方向还有 [EdgeProgressRing] 的进度弧带（中线半径 0.914R≈106.5dp、
+ *      线宽 6dp ⇒ 半径覆盖 103.5..109.5dp，角度 ±26.5°）。任何 36~40dp 圆钮想放在
+ *      三键右侧，中心距圆心必须 ≤ 85.5dp（=103.5−18，否则压进度弧），换算到 x 只能到
+ *      ~199.7dp，而三键右沿已到 194.5dp —— 物理上塞不进去（4dp 里放不下 36dp 钮）。
+ *   ② 5 颗按钮若保持 44dp，两端要跨 ±58°，-60° 位置（y≈163dp）会撞上三键区 prev/next
+ *      （底 155dp），同样无解。
+ *   ③ 底部弧是房间页唯一还有余量的操作区：缩到 36dp / 半径 92dp / 间距 23.5° 后，
+ *      相邻弦长 37.47dp 留 1.47dp 缝（改造前 4 颗 44dp/30° 是 1.55dp，观感一致），
+ *      每颗外沿 92+18 = **110dp，与改造前完全一致** —— 不压进度弧、不出圆、不碰三键区。
+ *   （几何推导与逐点校验见 docs/LT_UI_COLLECT.md。）
+ *
+ * 【红心态】
+ *   [liked] 由调用方从 `PlayerEngine.isLiked(current.id)` 反查（likedIds 是
+ *   mutableStateOf，读它即订阅，收藏成功/失败回滚都会自动重组）；点击走
+ *   ListenRoomScreen.toggleRoomLike（未登录提示 / 去重 / 乐观更新 / 失败校对 toast 全在那里）。
  */
 @Composable
 private fun ListenArcBar(
+    liked: Boolean,
+    onToggleLike: () -> Unit,
     onInvite: () -> Unit,
     onQueue: () -> Unit,
     onVolume: () -> Unit,
     onExit: () -> Unit,
 ) {
+    if (com.netmusiclite.data.AppearancePrefs.isM3e) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
+            Column(Modifier.padding(horizontal = 24.dp, vertical = 18.dp)) {
+                com.netmusiclite.ui.m3e.M3eListenActions(onInvite, onQueue, onVolume, onExit)
+            }
+        }
+        return
+    }
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val cx = maxWidth / 2
         val cyc = maxHeight / 2
-        val rBand = 88.dp
+        // 88dp → 92dp：5 颗 36dp 才能在 ±47° 内排开且外沿仍为 110dp（与 4 颗 44dp 时一致）
+        val rBand = 92.dp
 
         Canvas(Modifier.fillMaxSize()) {
             val stroke = 40.dp.toPx()
             val r = rBand.toPx()
+            // 弧段 -47°..+47°（以 6 点钟为 0°）＝ drawArc 的 43°..137°（0° 在 3 点钟、顺时针为正）
             drawArc(
                 color = Color.White.copy(alpha = 0.10f),
-                startAngle = 45f, sweepAngle = 90f, useCenter = false,
+                startAngle = 43f, sweepAngle = 94f, useCenter = false,
                 topLeft = Offset((size.width - r * 2) / 2f, (size.height - r * 2) / 2f),
                 size = Size(r * 2, r * 2),
                 style = Stroke(stroke, cap = StrokeCap.Round),
@@ -1315,27 +1515,41 @@ private fun ListenArcBar(
             val rInner = r - stroke / 2 - 0.75.dp.toPx()
             drawArc(
                 color = Color.White.copy(alpha = 0.10f),
-                startAngle = 45f, sweepAngle = 90f, useCenter = false,
+                startAngle = 43f, sweepAngle = 94f, useCenter = false,
                 topLeft = Offset((size.width - rInner * 2) / 2f, (size.height - rInner * 2) / 2f),
                 size = Size(rInner * 2, rInner * 2),
                 style = Stroke(1.5.dp.toPx(), cap = StrokeCap.Round),
             )
         }
 
-        val angles = listOf(-45f, -15f, 15f, 45f)
-        val icons = listOf(NcmIcons.Together, NcmIcons.Playlist, NcmIcons.Volume, NcmIcons.Close)
-        val actions = listOf(onInvite, onQueue, onVolume, onExit)
+        // 第 3 颗（角度 0°，屏幕正下方）＝ 收藏当前歌：与「邀请/歌单」同属内容操作，
+        // 两侧分别是音量/退出，危险操作（退出）仍留在最右端不易误触。
+        val angles = listOf(-47f, -23.5f, 0f, 23.5f, 47f)
+        val icons = listOf(
+            NcmIcons.Together, NcmIcons.Playlist,
+            if (liked) NcmIcons.HeartFill else NcmIcons.Heart,
+            NcmIcons.Volume, NcmIcons.Close,
+        )
+        val descs = listOf(
+            "邀请好友", "房间歌单",
+            if (liked) "取消收藏" else "收藏",
+            "音量", "退出房间",
+        )
+        val actions = listOf(onInvite, onQueue, onToggleLike, onVolume, onExit)
         angles.forEachIndexed { i, deg ->
             val rad = Math.toRadians(deg.toDouble())
             val x = cx + rBand * sin(rad).toFloat()
             val y = cyc + rBand * cos(rad).toFloat()
             CircleIconButton(
-                icons[i], "操作", actions[i],
+                icons[i], descs[i], actions[i],
                 modifier = Modifier.offset {
-                    IntOffset((x - 22.dp).roundToPx(), (y - 22.dp).roundToPx())
+                    // 36dp 钮 ⇒ 左上角偏移 = 圆心 − 18dp
+                    IntOffset((x - 18.dp).roundToPx(), (y - 18.dp).roundToPx())
                 },
-                size = 44.dp, iconSize = 18.dp,
+                size = 36.dp, iconSize = 17.dp,
                 container = Color.Transparent,
+                // 已收藏点亮成主题强调色；其余（含未收藏的红心）保持底栏原墨色
+                tint = if (i == 2 && liked) Accent else com.netmusiclite.ui.theme.PlayTextPrimary,
             )
         }
     }
@@ -1346,10 +1560,15 @@ private fun ListenArcBar(
 /**
  * 房间聊天（上滑进入，下滑或右滑返回）。
  *
- * 收：**房内公共聊天**（`listen/together/multi/special/msg/history`，官方 Lad0/v 通道）——
- *     每 8s 拉一页，按 `uid_sendTime` 去重浮出；含进房前的历史与官方客户端用户的发言。
- * 发：优先房内消息通道；乐迷团房（发言走云信长连接，HTTP 无写端点）明确提示改用官方客户端；
- *     普通房回退私信桥接（成员是邀请来的熟人）。输入区沿用好友聊天页结构。
+ * 收：**只用房内通道**，两路每拍并读 ——
+ *     `listen/together/multi/special/msg/history`（乐迷团房）+
+ *     `middle/im/chatroom/msg/history/query`（双人房的云信聊天室）。
+ *     每 8s 一轮，按 `uid_sendTime` 跨通道去重浮出，含进房前的历史与官方客户端用户的发言。
+ * 发：云信聊天室直发 `eapi/room/chat/sendMsg` → 官方 `middle/im/chatroom/send` 探测；
+ *     **绝不退私信**（2026-10-01 起，见 [ListenChatStore.send] 的 KDoc）。
+ *
+ * ★ 2026-10-24：删掉「普通房每 16s 拉一轮成员私信」的桥接 —— 用户报
+ *   「歌房消息通道和个人私信混用」，正是这里把两人的私聊历史灌进了房间面板。
  */
 /** 聊天时间分隔用的 HH:mm */
 private fun hhmm(ms: Long): String {
@@ -1372,24 +1591,19 @@ private fun ListenChatPanel(onClose: () -> Unit) {
     // 进房前的历史与本次会话之间画一条分隔线（按时间戳找第一条「进房后」消息）
     val dividerIdx = messages.indexOfFirst { it.timeMs >= startMs }
 
-    // 面板挂载期轮询（准实时）：① 房内公共聊天每 8s 拉最新一页（新消息按 uid_sendTime
-    // 去重浮出，含对方在官方客户端房内发的）；② 普通房桥接私信每 16s 拉一轮。
-    // 离开面板协程自动取消，不耗后台。
+    // 面板挂载期轮询（准实时）：两路房内通道每 8s 各拉一页（新消息按 uid_sendTime
+    // 去重浮出，含对方在官方客户端房内发的）。离开面板协程自动取消，不耗后台。
     LaunchedEffect(ListenSession.roomId) {
         if (!ListenSession.active) return@LaunchedEffect
         runCatching { ListenChatStore.refreshRoomHistory() }
-        runCatching { ListenChatStore.refresh(includeBeforeJoin = true) }
-        var tick = 0
         while (ListenSession.active) {
             delay(8_000)
-            tick++
             runCatching { ListenChatStore.refreshRoomHistory() }
-            if (tick % 2 == 0) runCatching { ListenChatStore.refresh() }
         }
     }
 
     LaunchedEffect(messages.size) {
-        if (messages.isNotEmpty()) listState.animateScrollToItem(messages.size - 1)
+        if (messages.isNotEmpty()) listState.adaptiveAnimateScrollToItem(messages.size - 1)
     }
 
     Box(Modifier.fillMaxSize()) {
@@ -1417,12 +1631,9 @@ private fun ListenChatPanel(onClose: () -> Unit) {
                 if (messages.isEmpty()) {
                     item(key = "empty") {
                         Text(
-                            if (ListenSession.isFltRoom)
-                                "还没有消息\n这里显示乐迷团房的公共聊天\n（含官方客户端用户的发言）"
-                            else
-                                "还没有消息\n房内公共聊天几秒内同步（含官方客户端用户）",
+                            ListenChatStore.emptyHint(),
                             fontSize = 9.sp, color = TextSecondary, textAlign = TextAlign.Center,
-                            modifier = Modifier.padding(horizontal = 40.dp, vertical = 16.dp),
+                            modifier = Modifier.padding(horizontal = 34.dp, vertical = 16.dp),
                         )
                     }
                 }
@@ -1607,11 +1818,10 @@ private fun ListenChatPanel(onClose: () -> Unit) {
                     .width(112.dp)
                     .clip(RoundedCornerShape(50))
                     .padding(horizontal = 4.dp, vertical = 7.dp),
+                // ★ 2026-10-23 需求③：删除框内「说点什么…」占位（只留空白框）。
+                //   该输入框 width(112dp) + 纵向 7dp 内边距，高度由一行行高撑住，不会塌陷。
                 decorationBox = { inner ->
-                    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-                        if (input.text.isEmpty()) Text("说点什么…", fontSize = 10.sp, color = TextSecondary)
-                        inner()
-                    }
+                    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) { inner() }
                 },
             )
         }
@@ -1627,10 +1837,19 @@ private fun RoomQueueOverlay(
     onAddSong: () -> Unit,
     onPickRecommend: (Song) -> Unit,
     onRemove: (Int) -> Unit,
+    /** 收藏 / 取消收藏（写接口落到网易云账号；由 ListenRoomScreen 注入 toast 与失败校对） */
+    onToggleLike: (Song) -> Unit,
 ) {
+    // 系统 back（含华为式被系统吃掉的右滑）：先关本浮层，不动导航（2026-10-07 同批修复）
+    OverlayBackHandler { onDismiss() }
     val listState = rememberLazyListState()
     // 响应式读取：PlayerEngine.queue 已是 Compose 状态（2026-09-12），远端同步/别人加歌即刻反映
     val queue = PlayerEngine.queue
+    // 长按条目的操作浮层目标（2026-10-23 新增）：
+    // 「一起听收藏不可用」的根因是**本域没有收藏入口** —— 旧版长按只有一个动作
+    // 「从房间歌单删除」，用户在房间里想收藏时唯一能按的长按反而把歌删了。
+    // 现在长按先出操作浮层：收藏/取消收藏（真写接口）+ 从房间歌单删除，两个动作都写清楚。
+    var actionItem by remember { mutableStateOf<Pair<Int, Song>?>(null) }
     var recommend by remember { mutableStateOf<List<Song>>(emptyList()) }
     val flt = ListenSession.fltMode
     var pulling by remember { mutableStateOf(false) }
@@ -1638,10 +1857,52 @@ private fun RoomQueueOverlay(
     // 「换一批」：官方推荐没有独立端点，换一批 = 重新拉一次 sync/playlist/get
     var rcmdTick by remember { mutableStateOf(0) }
     var rcmdBusy by remember { mutableStateOf(false) }
+    // ★ 2026-10-23 修「换一批官方推荐不可用」：旧版点完只有列表静默不动——
+    //   「网络失败 / 官方这批没变 / 详情拉取失败 / 真的换了」四种结局在 UI 上一模一样，
+    //   用户只能判断成「按钮没反应」。这里把结果文案显式摆出来，成功也回一句，
+    //   让每次点击都有可见反馈（失败可重试，不会让人以为功能坏了）。
+    var rcmdNote by remember { mutableStateOf("") }
     // 顶部「搜索歌曲添加」：非空时列表整体切成搜索结果，清空即回房间歌单
     var query by remember { mutableStateOf(TextFieldValue("")) }
     var results by remember { mutableStateOf<List<Song>>(emptyList()) }
     var searching by remember { mutableStateOf(false) }
+
+    // ★ 2026-10-23：「换一批」公共逻辑抽成局部函数（打开浮层 / 点按钮 / 轮询更新三处复用）。
+    //   旧版三个问题都在这里收口：
+    //   ① 结果不落地：refreshRecommendation() 的返回值被直接丢掉，失败/没变化都是
+    //      「列表纹丝不动」，用户判定为按钮坏了 → 现在一律写 rcmdNote 文案；
+    //   ② 失败被吞：runCatching{}.getOrDefault(emptyList()) 把详情接口失败吞成空列表，
+    //      和「官方没给推荐」混为一谈 → 改用 recommendSongsOrNull() 区分；
+    //   ③ busy 卡死：调用方统一 try/finally + withTimeout，异常路径也一定复位。
+    suspend fun fetchRecommendOnce() {
+        val r = ListenSession.refreshRecommendationDetailed()
+        val fresh = ListenSession.recommendSongsOrNull()
+        if (fresh != null) recommend = fresh
+        rcmdNote = when {
+            r == ListenSession.RcmdResult.FAILED -> ListenSession.recommendNote.ifEmpty { "取推荐失败 · 请重试" }
+            fresh == null -> "推荐详情加载失败 · 请重试"
+            else -> ListenSession.recommendNote
+        }
+    }
+
+    /**
+     * 打开浮层/首次进页时的推荐加载（2026-10-24 新增）：**只展示，不换批**。
+     *
+     * 用户反馈「每次进房间歌单页没点换一批，推荐也自动换了一批」——
+     * 旧版 LaunchedEffect(pullTick) 直接调 [fetchRecommendOnce] → [ListenSession.refreshRecommendationDetailed]，
+     * 官方本房不下发推荐时该函数必然走本地兜底链（心动/FM），于是每打开一次就换一批。
+     * 现在：已有批次直接展示；没有批次只向官方补拉一次（[ListenSession.syncRcmdOnce]），
+     * 不产生本地批次；换批只由「换一批」按钮（rcmdTick）触发。
+     */
+    suspend fun loadRecommendOnce() {
+        ListenSession.syncRcmdOnce()
+        val fresh = ListenSession.recommendSongsOrNull()
+        if (fresh != null) recommend = fresh
+        rcmdNote = when {
+            fresh == null -> "推荐详情加载失败 · 请重试"
+            else -> "" // 没有推荐时交给空态文案；不要把"打开页面"伪装成"已换一批"
+        }
+    }
 
     // 打开即主动拉一次房间歌单（旧版只被动等轮询：轮询退避/失败时歌单永远空着，
     // 用户看到的就是「加载不出来」）。重试按钮把 pullTick +1 再跑一遍。
@@ -1652,17 +1913,38 @@ private fun RoomQueueOverlay(
         pulling = true
         runCatching { ListenSession.pullRoomQueueNow() }
         pulling = false
-        runCatching { ListenSession.refreshRecommendation() }
-        recommend = runCatching { ListenSession.recommendSongs() }.getOrDefault(emptyList())
+        rcmdBusy = true
+        try {
+            // ★ 2026-10-24：打开浮层只**展示**已有推荐（无批次才向官方补拉一次），
+            //   不再调 fetchRecommendOnce（那会走本地兜底 → 每次进页面自动换一批）。
+            kotlinx.coroutines.withTimeoutOrNull(15_000L) { loadRecommendOnce() }
+                ?: run { rcmdNote = "加载推荐超时 · 可点换一批重试" }
+        } finally {
+            rcmdBusy = false
+        }
     }
 
-    // 「换一批」：重拉官方播放列表响应，再解析其中的 rcmdSongIds
+    // 「换一批」：重拉官方播放列表响应，再解析其中的 rcmdSongIds。
+    // ★ 2026-10-23：busy 用 try/finally + 15s 超时兜底 —— 旧版若请求悬挂/effect 被取消，
+    //   「正在取官方推荐…」会一直挂着、按钮再也点不动，这正是「换一批不可用」的直接表现。
     LaunchedEffect(rcmdTick) {
         if (rcmdTick == 0) return@LaunchedEffect
         rcmdBusy = true
-        runCatching { ListenSession.refreshRecommendation() }
-        recommend = runCatching { ListenSession.recommendSongs() }.getOrDefault(emptyList())
-        rcmdBusy = false
+        try {
+            kotlinx.coroutines.withTimeoutOrNull(15_000L) { fetchRecommendOnce() }
+                ?: run { rcmdNote = "取推荐超时 · 请重试" }
+        } finally {
+            rcmdBusy = false
+        }
+    }
+
+    // ★ 2026-10-23：后台轮询（syncFromServer）拿到**新推荐批次**时自动刷新列表。
+    //   旧版 recommend 只在「打开浮层 / 点换一批」时拉一次：打开时官方还没下发推荐
+    //   （rcmdSongIds 为空）就永远停在一句「官方这批还没给推荐」，之后官方补了也不显示。
+    //   这也是「换一批没反应」的一种——按钮拉到的那批没变，而真实推荐其实已经到了。
+    LaunchedEffect(ListenSession.rcmdUpdatedAt) {
+        if (ListenSession.rcmdSongIds.isEmpty()) return@LaunchedEffect
+        ListenSession.recommendSongsOrNull()?.let { recommend = it }
     }
 
     // 搜索防抖 350ms（与「添加歌曲」浮层同规格）；清空即回房间歌单
@@ -1729,8 +2011,8 @@ private fun RoomQueueOverlay(
                             .fillMaxWidth()
                             .onGloballyPositioned { c ->
                                 // 只在列表静止时采样（见上方说明）
-                                val atRest = listState.firstVisibleItemIndex == 0 &&
-                                    listState.firstVisibleItemScrollOffset == 0
+                                val atRest = com.netmusiclite.ui.m3e.listFirstIndex(listState) == 0 &&
+                                    com.netmusiclite.ui.m3e.listFirstOffset(listState) == 0
                                 if (atRest) {
                                     val cy = c.positionInRoot().y + c.size.height / 2f
                                     if (abs(cy - fieldCenterY) > 0.5f) fieldCenterY = cy
@@ -1749,16 +2031,12 @@ private fun RoomQueueOverlay(
                                 .clip(RoundedCornerShape(50))
                                 .background(SurfaceGlass)
                                 .padding(horizontal = 14.dp, vertical = 8.dp),
+                            // ★ 2026-10-24 用户需求：搜索框恢复「搜点什么」占位（单行，不改变框高）。
                             decorationBox = { inner ->
                                 Box(Modifier.fillMaxWidth()) {
-                                    if (query.text.isEmpty())
-                                        // ⚠ 必须单行：折行会让框高随宽度变化，与「按中心算内缩」
-                                        //   形成自激回环（详见 AddSongOverlay 同处注释）。
-                                        Text(
-                                            "搜索歌曲添加到房间",
-                                            fontSize = 10.sp, color = TextSecondary,
-                                            maxLines = 1, overflow = TextOverflow.Ellipsis,
-                                        )
+                                    if (query.text.isEmpty()) {
+                                        Text("搜点什么", fontSize = 11.sp, color = TextSecondary)
+                                    }
                                     inner()
                                 }
                             },
@@ -1808,21 +2086,60 @@ private fun RoomQueueOverlay(
                     //   紧贴「＋ 添加歌曲到房间」正下方（用户口径）。玻璃底 + 主文字色，
                     //   与上面那颗强调色胶囊形成主次，不会两条抢眼。
                     if (!flt) item(key = "rcmd_refresh") {
-                        Text(
-                            if (rcmdBusy) "正在取官方推荐…" else "换一批官方推荐",
-                            fontSize = 11.sp,
-                            color = if (rcmdBusy) TextSecondary else TextPrimary,
-                            textAlign = TextAlign.Center,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(50))
-                                .background(SurfaceGlass)
-                                .clickable(
-                                    interactionSource = remember { MutableInteractionSource() },
-                                    indication = null,
-                                ) { if (!rcmdBusy) rcmdTick++ }
-                                .padding(vertical = 10.dp),
-                        )
+                        Column(Modifier.fillMaxWidth()) {
+                            Text(
+                                // ★ 2026-10-23 二轮：本房官方不下发推荐时走的是本地「按口味」兜底，
+                                //   按钮文案必须跟着来源改名（否则用户以为还是官方那批、换不动就=坏了）
+                                when {
+                                    rcmdBusy -> "正在取推荐…"
+                                    ListenSession.rcmdSource == ListenSession.RcmdSource.LOCAL -> "换一批按口味推荐"
+                                    else -> "换一批官方推荐"
+                                },
+                                fontSize = 11.sp,
+                                color = if (rcmdBusy) TextSecondary else TextPrimary,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(50))
+                                    .background(SurfaceGlass)
+                                    .clickable(
+                                        interactionSource = remember { MutableInteractionSource() },
+                                        indication = null,
+                                    ) { if (!rcmdBusy) rcmdTick++ }
+                                    .padding(vertical = 10.dp),
+                            )
+                            // ★ 2026-10-23：点击结果文案（已换 / 官方没换 / 网络失败 / 超时）。
+                            //   旧版点完毫无反馈，四种结局长得一模一样 → 用户只能判断成「按钮没用」。
+                            if (rcmdNote.isNotEmpty() && !rcmdBusy) {
+                                Text(
+                                    rcmdNote,
+                                    fontSize = 8.sp, color = TextSecondary,
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(top = 3.dp, start = 6.dp, end = 6.dp),
+                                )
+                            }
+                        }
+                    }
+
+                    // ★ 2026-10-23 二轮：队列上报失败**不再静默**。
+                    //   旧版 queueSyncNote 只在「歌单为空」时展示 → 非房主加歌被服务端拒、
+                    //   导致本地有/全房没有时，界面上完全看不出来（用户以为加成功了）。
+                    //   现在只要上报失败/被拒就常显一条（有内容才显示，成功后自动清空）。
+                    if (!flt && ListenSession.queueSyncNote.isNotEmpty()) {
+                        item(key = "queue_sync_note") {
+                            Text(
+                                text = ListenSession.queueSyncNote,
+                                fontSize = 8.sp,
+                                color = if (ListenSession.queueReportRejected) Color(0xFFFF8A65)
+                                else TextSecondary,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(top = 4.dp, start = 6.dp, end = 6.dp),
+                            )
+                        }
                     }
 
                     if (queue.isEmpty()) {
@@ -1870,8 +2187,9 @@ private fun RoomQueueOverlay(
                             isCurrent = PlayerEngine.current?.id == s.id,
                             height = 52.dp,
                             onClick = { onPick(i) },
-                            // ★ 长按从**房间歌单**里删掉这一首（与「取消收藏」无关，不动收藏数据）
-                            onLongClick = { onRemove(i) },
+                            // ★ 2026-10-23：长按改为**操作浮层**（收藏/取消收藏 + 从房间歌单删除）。
+                            //   旧版长按直接删除：用户想收藏时按了长按，歌被删了还以为是「收藏没反应」。
+                            onLongClick = { actionItem = i to s },
                         )
                     }
 
@@ -1880,26 +2198,44 @@ private fun RoomQueueOverlay(
                     // 整块消失、无从判断。「换一批」按钮已上移到「＋ 添加歌曲到房间」下方。
                     // FLT 乐迷团房无本地歌权，推荐入口整体隐藏。
                     if (!flt) {
+                        // ★ 2026-10-24（用户反馈：推荐的歌曲不会进入播放列表，一直晾在推荐区）：
+                        //   推荐列表按「已在房间歌单」过滤 —— 点一首加进歌单后，它应立即从推荐区消失，
+                        //   房间歌单/播放队列里出现；旧版只在打开浮层时取一次 recommend，
+                        //   加歌后不重算，于是同一首歌一直挂在推荐区，看起来像没加进去。
+                        val rcmdVisible = recommend.filterNot { ListenSession.inQueue(it.id) }
                         item(key = "rcmd_head") {
                             Text(
-                                "房间推荐 · 官方同款推荐歌单",
+                                // ★ 2026-10-23 二轮：来源跟着 rcmdSource 走（官方 vs 按口味兜底）
+                                if (ListenSession.rcmdSource == ListenSession.RcmdSource.LOCAL)
+                                    "按口味推荐 · 本机推荐源（官方本房未下发）"
+                                else "房间推荐 · 官方同款推荐歌单",
                                 fontSize = 9.sp, color = TextSecondary,
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .padding(top = 10.dp, bottom = 2.dp, start = 4.dp),
                             )
                         }
-                        if (recommend.isEmpty()) {
+                        if (rcmdVisible.isEmpty()) {
                             item(key = "rcmd_empty") {
                                 Text(
-                                    if (rcmdBusy) "正在向官方服务取推荐…"
-                                    else "官方这批还没给推荐 · 点上方「换一批官方推荐」重取",
+                                    // ★ 2026-10-23：区分三种空态。旧版一律「官方这批还没给推荐」，
+                                    //   把「详情接口失败」也说成官方没给，用户点换一批只会更困惑。
+                                    // ★ 2026-10-23 二轮：优先展示 data 层给的真实结局文案
+                                    //   （已换 / 官方未下发改按口味 / 详情失败 / 网络失败），
+                                    //   不再把「本地兜底」也说成「官方没给推荐」。
+                                    when {
+                                        rcmdBusy -> "正在取推荐…"
+                                        ListenSession.recommendNote.isNotEmpty() -> ListenSession.recommendNote
+                                        ListenSession.rcmdSource == ListenSession.RcmdSource.LOCAL ->
+                                            "还没有推荐 · 点上方「换一批按口味推荐」重取"
+                                        else -> "还没有推荐 · 点上方「换一批」重取"
+                                    },
                                     fontSize = 9.sp, color = TextSecondary,
                                     modifier = Modifier.fillMaxWidth().padding(start = 4.dp, top = 2.dp),
                                 )
                             }
                         } else {
-                            itemsIndexed(recommend, key = { i, s -> "r$i-${s.id}" }) { _, s ->
+                            itemsIndexed(rcmdVisible, key = { i, s -> "r$i-${s.id}" }) { _, s ->
                                 StackedSongCard(
                                     song = s,
                                     height = 52.dp,
@@ -1907,6 +2243,45 @@ private fun RoomQueueOverlay(
                                 )
                             }
                         }
+                    }
+                }
+            }
+        }
+        // ★ 2026-10-23：长按房间歌单条目后的操作浮层。
+        //   为什么加：「一起听收藏不可用」的根因是一起听域根本没有收藏入口；
+        //   本页长按旧版直接删除，用户在房间里收藏无门。现在长按先出本浮层，
+        //   收藏走真写接口（NcmApi.likeSong），删除仍是原来的房间歌单移除。
+        actionItem?.let { pair ->
+            val (idx, s) = pair
+            val liked = PlayerEngine.isLiked(s.id)
+            DialogScrim(onDismiss = { actionItem = null }) {
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(22.dp))
+                        .background(BgElevated)
+                        .padding(horizontal = 13.dp, vertical = 12.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Text(
+                        s.title, fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                        color = TextPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    )
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        s.artist, fontSize = 8.5.sp, color = TextSecondary,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    // 收藏状态用引擎里的红心集合反查：显示「取消收藏」即代表当前已收藏
+                    RoomActionRow(if (liked) "取消收藏" else "收藏", Accent) {
+                        actionItem = null
+                        onToggleLike(s)
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    RoomActionRow("从房间歌单删除", TextSecondary) {
+                        actionItem = null
+                        onRemove(idx)
                     }
                 }
             }
@@ -1922,6 +2297,38 @@ private fun RoomQueueOverlay(
     }
 }
 
+/**
+ * 房间歌单长按操作浮层里的单个动作按钮（胶囊）。
+ * 视觉与搜索页长按菜单的 SongActionRow 同规格：玻璃底 + 动作色描边，
+ * 深/浅两套主题下都不会出现「浅字压浅底看不见」。本文件不能用搜索页的 private 实现，
+ * 故按同一形态在本地复刻（不新造样式）。
+ */
+@Composable
+private fun RoomActionRow(
+    label: String,
+    color: Color,
+    onClick: () -> Unit,
+) {
+    Text(
+        label,
+        fontSize = 10.sp, color = color, fontWeight = FontWeight.SemiBold,
+        textAlign = TextAlign.Center,
+        maxLines = 1,
+        softWrap = false,
+        overflow = TextOverflow.Ellipsis,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(50))
+            .background(SurfaceGlass)
+            .border(1.dp, color.copy(alpha = 0.55f), RoundedCornerShape(50))
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+            ) { onClick() }
+            .padding(vertical = 8.dp),
+    )
+}
+
 // ==================== 添加歌曲浮层 ====================
 
 /**
@@ -1935,6 +2342,8 @@ private fun AddSongOverlay(
     onPick: (Song) -> Unit,
     onPickMany: (List<Song>) -> Unit,
 ) {
+    // 系统 back（含华为式被系统吃掉的右滑）：先关本浮层，不动导航（2026-10-07 同批修复）
+    OverlayBackHandler { onDismiss() }
     val listState = rememberLazyListState()
     var songs by remember { mutableStateOf<List<Song>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
@@ -1999,108 +2408,195 @@ private fun AddSongOverlay(
             //   可用宽度，左右内缩；只改横向、不改纵向，不会产生测量回环。
             //   （与歌单浮层同一套做法，此前只有歌单浮层做了、这一层漏了。）
             //
-            // ⚠ 硬约束：**框内文字必须恒为单行**（占位文案 maxLines=1）。
+            // ⚠ 硬约束：**框内文字必须恒为单行**（占位文案单行）。
             //   否则会自激：宽度变窄 → 占位文案折行 → 框变高 → 中心下移 → 内缩变小 →
             //   宽度变宽 → 折行消失 → 框变矮 → 中心上移 → 内缩变大 …… 每帧来回，
             //   真机表现就是「点开添加歌曲后整页疯狂抽动」。
+            //
+            // ★ 2026-10-24 用户需求（m3e 主题）：搜索框不再悬浮在顶部 ——
+            //   改为列表第一项、随歌曲列表一起滚动，并与下方第一首歌曲间隔 20px（@2.0 ≈ 10dp）。
+            val isM3e = com.netmusiclite.data.AppearancePrefs.isM3e
             var fieldCenterY by remember { mutableStateOf(0f) }
             val fieldInsetDp = with(androidx.compose.ui.platform.LocalDensity.current) {
                 circleSafeInsetPx(fieldCenterY).toDp()
             }
-            Box(
-                Modifier
-                    .fillMaxWidth()
-                    .onGloballyPositioned { c ->
-                        val cy = c.positionInRoot().y + c.size.height / 2f
-                        if (abs(cy - fieldCenterY) > 0.5f) fieldCenterY = cy
-                    }
-                    .padding(horizontal = fieldInsetDp),
-            ) {
-                BasicTextField(
-                    value = query,
-                    onValueChange = { query = it },
-                    singleLine = true,
-                    textStyle = TextStyle(fontSize = 11.sp, color = TextPrimary),
-                    cursorBrush = SolidColor(Accent),
-                    modifier = Modifier
+            val searchField: @Composable () -> Unit = {
+                Box(
+                    Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(50))
-                        .background(SurfaceGlass)
-                        .padding(horizontal = 14.dp, vertical = 8.dp),
-                    decorationBox = { inner ->
-                        Box(Modifier.fillMaxWidth()) {
-                            if (query.text.isEmpty())
-                                // 文案压到 9 字以内：内缩后可用宽度约 98dp，再长就会被省略号截断
-                                Text(
-                                    "搜索歌曲 / 长按多选",
-                                    fontSize = 10.sp, color = TextSecondary,
-                                    maxLines = 1, overflow = TextOverflow.Ellipsis,
-                                )
-                            inner()
+                        .onGloballyPositioned { c ->
+                            // m3e 下搜索框随列表滚动：只在列表静止时采样中心 y，
+                            // 否则滚动中每帧变化 → 横向内缩抖动（见上方自激说明）。
+                            val atRest = !isM3e ||
+                                (com.netmusiclite.ui.m3e.listFirstIndex(listState) == 0 &&
+                                    com.netmusiclite.ui.m3e.listFirstOffset(listState) == 0)
+                            if (atRest) {
+                                val cy = c.positionInRoot().y + c.size.height / 2f
+                                if (abs(cy - fieldCenterY) > 0.5f) fieldCenterY = cy
+                            }
                         }
-                    },
-                )
-            }
-            Spacer(Modifier.height(6.dp))
-
-            when {
-                loading -> Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
-                    Text("加载中…", fontSize = 11.sp, color = TextSecondary)
-                }
-                searching -> Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
-                    Text("搜索中…", fontSize = 11.sp, color = TextSecondary)
-                }
-                display.isEmpty() -> Column(
-                    Modifier.weight(1f).padding(horizontal = 26.dp),
-                    verticalArrangement = Arrangement.Center,
-                    horizontalAlignment = Alignment.CenterHorizontally,
+                        .padding(horizontal = fieldInsetDp),
                 ) {
-                    Text(
-                        when {
-                            kw.isNotEmpty() -> "没有找到「${kw.take(8)}」"
-                            SessionStore.uid <= 0L -> "未登录，读不到「我喜欢的音乐」\n可直接用上方搜索添加"
-                            else -> "「我喜欢的音乐」为空\n可用上方搜索添加"
+                    BasicTextField(
+                        value = query,
+                        onValueChange = { query = it },
+                        singleLine = true,
+                        textStyle = TextStyle(fontSize = 11.sp, color = TextPrimary),
+                        cursorBrush = SolidColor(Accent),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(50))
+                            .background(SurfaceGlass)
+                            .padding(horizontal = 14.dp, vertical = 8.dp),
+                        // ★ 2026-10-24 用户需求：搜索框恢复「搜点什么」占位（单行，不改变框高）。
+                        decorationBox = { inner ->
+                            Box(Modifier.fillMaxWidth()) {
+                                if (query.text.isEmpty()) {
+                                    Text("搜点什么", fontSize = 11.sp, color = TextSecondary)
+                                }
+                                inner()
+                            }
                         },
-                        fontSize = 11.sp, color = TextSecondary, textAlign = TextAlign.Center,
                     )
-                    if (kw.isEmpty()) {
-                        Spacer(Modifier.height(14.dp))
-                        Text(
-                            "重新加载",
-                            fontSize = 11.sp, color = Accent,
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(50))
-                                .background(Accent.copy(alpha = 0.14f))
-                                .clickable(
-                                    interactionSource = remember { MutableInteractionSource() },
-                                    indication = null,
-                                ) { loadTick++ }
-                                .padding(horizontal = 20.dp, vertical = 9.dp),
-                        )
-                    }
                 }
-                else -> LazyColumn(
+            }
+            if (!isM3e) {
+                searchField()
+                Spacer(Modifier.height(6.dp))
+            }
+
+            if (isM3e) {
+                LazyColumn(
                     Modifier.weight(1f),
                     state = listState,
                     verticalArrangement = Arrangement.spacedBy(6.dp),
                     contentPadding = PaddingValues(top = 2.dp, bottom = 78.dp),
                 ) {
-                    itemsIndexed(display, key = { _, s -> s.id }) { _, s ->
-                        StackedSongCard(
-                            song = s,
-                            height = 52.dp,
-                            selectMode = multi,
-                            selected = s.id in selected,
-                            onLongClick = {
-                                if (!multi) { multi = true }
-                                if (s.id !in selected) selected.add(s.id)
+                    item(key = "search") {
+                        searchField()
+                        Spacer(Modifier.height(10.dp)) // 20px @2.0：与下方第一首歌曲的间隔
+                    }
+                    when {
+                        loading -> item(key = "loading") {
+                            Box(Modifier.fillMaxWidth().padding(vertical = 28.dp), contentAlignment = Alignment.Center) {
+                                Text("加载中…", fontSize = 11.sp, color = TextSecondary)
+                            }
+                        }
+                        searching -> item(key = "searching") {
+                            Box(Modifier.fillMaxWidth().padding(vertical = 28.dp), contentAlignment = Alignment.Center) {
+                                Text("搜索中…", fontSize = 11.sp, color = TextSecondary)
+                            }
+                        }
+                        display.isEmpty() -> item(key = "empty") {
+                            Column(
+                                Modifier.fillMaxWidth().padding(horizontal = 26.dp, vertical = 24.dp),
+                                verticalArrangement = Arrangement.Center,
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                            ) {
+                                Text(
+                                    when {
+                                        kw.isNotEmpty() -> "没有找到「${kw.take(8)}」"
+                                        SessionStore.uid <= 0L -> "未登录，读不到「我喜欢的音乐」\n可直接用上方搜索添加"
+                                        else -> "「我喜欢的音乐」为空\n可用上方搜索添加"
+                                    },
+                                    fontSize = 11.sp, color = TextSecondary, textAlign = TextAlign.Center,
+                                )
+                                if (kw.isEmpty()) {
+                                    Spacer(Modifier.height(14.dp))
+                                    Text(
+                                        "重新加载",
+                                        fontSize = 11.sp, color = Accent,
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(50))
+                                            .background(Accent.copy(alpha = 0.14f))
+                                            .clickable(
+                                                interactionSource = remember { MutableInteractionSource() },
+                                                indication = null,
+                                            ) { loadTick++ }
+                                            .padding(horizontal = 20.dp, vertical = 9.dp),
+                                    )
+                                }
+                            }
+                        }
+                        else -> itemsIndexed(display, key = { _, s -> s.id }) { _, s ->
+                            StackedSongCard(
+                                song = s,
+                                height = 52.dp,
+                                selectMode = multi,
+                                selected = s.id in selected,
+                                onLongClick = {
+                                    if (!multi) { multi = true }
+                                    if (s.id !in selected) selected.add(s.id)
+                                },
+                                onClick = {
+                                    if (multi) {
+                                        if (s.id in selected) selected.remove(s.id) else selected.add(s.id)
+                                    } else onPick(s)
+                                },
+                            )
+                        }
+                    }
+                }
+            } else {
+                when {
+                    loading -> Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                        Text("加载中…", fontSize = 11.sp, color = TextSecondary)
+                    }
+                    searching -> Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                        Text("搜索中…", fontSize = 11.sp, color = TextSecondary)
+                    }
+                    display.isEmpty() -> Column(
+                        Modifier.weight(1f).padding(horizontal = 26.dp),
+                        verticalArrangement = Arrangement.Center,
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        Text(
+                            when {
+                                kw.isNotEmpty() -> "没有找到「${kw.take(8)}」"
+                                SessionStore.uid <= 0L -> "未登录，读不到「我喜欢的音乐」\n可直接用上方搜索添加"
+                                else -> "「我喜欢的音乐」为空\n可用上方搜索添加"
                             },
-                            onClick = {
-                                if (multi) {
-                                    if (s.id in selected) selected.remove(s.id) else selected.add(s.id)
-                                } else onPick(s)
-                            },
+                            fontSize = 11.sp, color = TextSecondary, textAlign = TextAlign.Center,
                         )
+                        if (kw.isEmpty()) {
+                            Spacer(Modifier.height(14.dp))
+                            Text(
+                                "重新加载",
+                                fontSize = 11.sp, color = Accent,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(50))
+                                    .background(Accent.copy(alpha = 0.14f))
+                                    .clickable(
+                                        interactionSource = remember { MutableInteractionSource() },
+                                        indication = null,
+                                    ) { loadTick++ }
+                                    .padding(horizontal = 20.dp, vertical = 9.dp),
+                            )
+                        }
+                    }
+                    else -> LazyColumn(
+                        Modifier.weight(1f),
+                        state = listState,
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                        contentPadding = PaddingValues(top = 2.dp, bottom = 78.dp),
+                    ) {
+                        itemsIndexed(display, key = { _, s -> s.id }) { _, s ->
+                            StackedSongCard(
+                                song = s,
+                                height = 52.dp,
+                                selectMode = multi,
+                                selected = s.id in selected,
+                                onLongClick = {
+                                    if (!multi) { multi = true }
+                                    if (s.id !in selected) selected.add(s.id)
+                                },
+                                onClick = {
+                                    if (multi) {
+                                        if (s.id in selected) selected.remove(s.id) else selected.add(s.id)
+                                    } else onPick(s)
+                                },
+                            )
+                        }
                     }
                 }
             }
@@ -2141,12 +2637,16 @@ private fun AddSongOverlay(
 
 // ==================== 邀请好友浮层 ====================
 
-/** 点底部「多人」钮进入：好友列表，点谁就邀请谁 */
+/** 点底部「多人」钮进入：好友列表，点谁就邀请谁；顶部首项是「分享邀请链接」 */
 @Composable
 private fun InviteFriendsOverlay(
     onDismiss: () -> Unit,
     onInvite: (FriendInfo) -> Unit,
+    /** 复制邀请链接并立刻 toast「邀请链接已复制」（复制逻辑与提示都在 ListenRoomScreen 内） */
+    onShareLink: () -> Unit,
 ) {
+    // 系统 back（含华为式被系统吃掉的右滑）：先关本浮层，不动导航（2026-10-07 同批修复）
+    OverlayBackHandler { onDismiss() }
     val listState = rememberLazyListState()
     var friends by remember { mutableStateOf<List<FriendInfo>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
@@ -2182,6 +2682,18 @@ private fun InviteFriendsOverlay(
                 .rotaryList(listState),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
+            // ★ 2026-10-23 新增：**一眼可见的「分享邀请链接」入口**。
+            //   背景：一起听页原本没有任何分享按钮（`shareLink()` 只出现在本浮层「点某个好友」
+            //   的回调里，用户想"点分享"根本没地方点，复制动作也没有可见反馈）。
+            //   放在 Column 顶部：好友列表空 / 加载中 / 已加载三种状态都能用。
+            //   点击后由 ListenRoomScreen 复制链接并立刻弹 toast「邀请链接已复制」。
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(top = 18.dp, start = 16.dp, end = 16.dp),
+            ) {
+                RoomShareRow { onShareLink() }
+            }
             if (loading) {
                 Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
                     Text("加载好友…", fontSize = 11.sp, color = TextSecondary)
@@ -2232,6 +2744,51 @@ private fun InviteFriendsOverlay(
                 .padding(bottom = 16.dp),
             size = 36.dp, iconSize = 15.dp,
         )
+    }
+}
+
+/**
+ * 邀请浮层顶部的「分享邀请链接」卡（2026-10-23 新增）。
+ *
+ * 一起听内唯一的分享动作就是复制邀请链接：点一下 → `ListenSession.shareLink()` →
+ * clipboard.setText → 立刻 toast「邀请链接已复制」（复用本页 NcmToast，不新造弹窗组件）。
+ * 房间还没拿到服务端真房号时 shareLink() 返回 null，本行不发复制、只提示「未就绪」。
+ */
+@Composable
+private fun RoomShareRow(onClick: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(30.dp))
+            .background(Accent.copy(alpha = 0.16f))
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+            ) { onClick() }
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            Modifier
+                .size(30.dp)
+                .clip(CircleShape)
+                .background(Accent.copy(alpha = 0.22f)),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(NcmIcons.Copy, null, tint = Accent, modifier = Modifier.size(15.dp))
+        }
+        Spacer(Modifier.width(10.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                "分享邀请链接", fontSize = 12.sp, color = TextPrimary,
+                fontWeight = FontWeight.Medium, maxLines = 1,
+            )
+            Text(
+                "复制后发给好友，点开即可进房", fontSize = 9.sp, color = TextSecondary,
+                maxLines = 1, overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Text("复制", fontSize = 9.sp, color = Accent, fontWeight = FontWeight.SemiBold)
     }
 }
 

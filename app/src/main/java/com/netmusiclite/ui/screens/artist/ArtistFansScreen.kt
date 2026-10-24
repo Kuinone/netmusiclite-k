@@ -16,7 +16,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
+import com.netmusiclite.ui.m3e.AdaptiveLazyColumn as LazyColumn
+import com.netmusiclite.ui.m3e.M3eListMode
+import com.netmusiclite.ui.m3e.m3eSinkFromCenter
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
@@ -192,7 +194,7 @@ fun ArtistFansScreen(nav: NavHostController, artistId: Long) {
 
     val endVisible by remember {
         derivedStateOf {
-            val info = listState.layoutInfo
+            val info = com.netmusiclite.ui.m3e.listLayoutInfo(listState)
             info.totalItemsCount > 0 &&
                 (info.visibleItemsInfo.lastOrNull()?.index ?: -1) >= info.totalItemsCount - 2
         }
@@ -212,8 +214,8 @@ fun ArtistFansScreen(nav: NavHostController, artistId: Long) {
         val headerFadePx = with(LocalDensity.current) { 46.dp.toPx() }
         val headerFade by remember {
             derivedStateOf {
-                val off = if (listState.firstVisibleItemIndex == 0)
-                    listState.firstVisibleItemScrollOffset.toFloat() else headerFadePx
+                val off = if (com.netmusiclite.ui.m3e.listFirstIndex(listState) == 0)
+                    com.netmusiclite.ui.m3e.listFirstOffset(listState).toFloat() else headerFadePx
                 (1f - off / headerFadePx).coerceIn(0f, 1f)
             }
         }
@@ -225,7 +227,13 @@ fun ArtistFansScreen(nav: NavHostController, artistId: Long) {
             // 顶部留出悬浮标题的高度，卡片从标题下方滚入。
             // 2026-10-01：卡片整体缩小 14% —— 左右内距 11 → 25.7dp，
             // 卡片实际宽度 ≈ 屏宽 86%，与卡片内部元素（字号/头像/图片）同步缩放。
+            // ★ 2026-10-17：m3e 下横向内距改为「两侧取最大值后对称」（见 M3eShared.NativeList），
+            //   25.7dp 会同时作用于左右 ⇒ 帖子卡严格沿屏幕竖直中线对称（用户口径）。
             contentPadding = PaddingValues(start = 25.7.dp, end = 25.7.dp, top = 46.dp, bottom = 26.dp),
+            // ★ 2026-10-17 用户口径「m3e 主题下乐迷团帖子禁止堆叠只允许下沉效果」：
+            //   走 SINK = 不压缩 item 占位高度（禁掉条目互相挤压/遮盖的「堆叠」），
+            //   也不给 Material 组件形变；下沉由列表项层统一做（缩放 + 变暗，不改布局）。
+            mode = M3eListMode.SINK,
         ) {
             when {
                 loading -> item(key = "loading") {
@@ -262,7 +270,11 @@ fun ArtistFansScreen(nav: NavHostController, artistId: Long) {
                     items(posts, key = { it.id }) { p ->
                         PostCard(
                             p,
-                            modifier = Modifier.postCardLift(halfPx),
+                            // ★ 2026-10-17 用户口径「m3e 主题下乐迷团帖子禁止堆叠只允许下沉」：
+                            //   堆叠（transformedHeight 高度压缩）已在列表层关掉（mode = SINK）；
+                            //   下沉在这里声明：只作用于帖子卡片本体，按距屏幕竖直中线的距离
+                            //   缩放 + 变暗。postCardLift 在 m3e 下是空操作（经典主题保留原倾斜观感）。
+                            modifier = Modifier.postCardLift(halfPx).m3eSinkFromCenter(),
                             onLike = { toggleLike(p) },
                             onOpen = {
                                 FanPostBus.post = p
@@ -325,6 +337,7 @@ fun ArtistFansScreen(nav: NavHostController, artistId: Long) {
  */
 @Composable
 private fun Modifier.postCardLift(halfPx: Float): Modifier {
+    if (com.netmusiclite.data.AppearancePrefs.isM3e) return this
     var centerY by remember { mutableFloatStateOf(halfPx) }
     return this
         .onGloballyPositioned { ic ->

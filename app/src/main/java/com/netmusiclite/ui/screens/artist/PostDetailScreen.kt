@@ -12,7 +12,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
+import com.netmusiclite.ui.m3e.AdaptiveLazyColumn as LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
@@ -129,7 +129,7 @@ fun PostDetailScreen(nav: NavHostController) {
 
     val endVisible by remember {
         derivedStateOf {
-            val info = listState.layoutInfo
+            val info = com.netmusiclite.ui.m3e.listLayoutInfo(listState)
             info.totalItemsCount > 0 &&
                 (info.visibleItemsInfo.lastOrNull()?.index ?: -1) >= info.totalItemsCount - 2
         }
@@ -313,7 +313,7 @@ fun PostDetailScreen(nav: NavHostController) {
     if (inputting) {
         TextInputDialog(
             title = "写评论",
-            placeholder = "说点什么…",
+            // ★ 2026-10-23 需求③：不再传框内占位文案（全站输入框占位统一删除）。
             confirmText = "发送",
             onConfirm = {
                 inputting = false

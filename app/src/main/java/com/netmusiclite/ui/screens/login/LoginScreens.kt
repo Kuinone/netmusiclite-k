@@ -1,6 +1,7 @@
 package com.netmusiclite.ui.screens.login
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -31,6 +32,7 @@ import com.netmusiclite.data.NcmApi
 import com.netmusiclite.data.SessionStore
 import com.netmusiclite.ui.components.NcmIcons
 import com.netmusiclite.ui.components.QrCodeImage
+import com.netmusiclite.ui.components.frostedGlass
 import com.netmusiclite.ui.theme.Bg
 import com.netmusiclite.ui.theme.screenBg
 import com.netmusiclite.ui.theme.Green
@@ -41,11 +43,17 @@ import kotlinx.coroutines.delay
 /**
  * 扫码登录（首启 / 退出后再登 / 添加账号共用）。
  * 流程：qr/key 拿 unikey → 二维码 → 每 1.8s 轮询 → 803 成功存 MUSIC_U。
+ *
+ * ★ 2026-10-06 「不登录进入音乐」入口（用户口径）：底部小胶囊，点击后以**访客模式**
+ *  直接进主页（主页只显示 听本地音乐 / 听歌排行 / 最近播放 / 设置 四卡、无头像徽章）；
+ *  之后在设置内添加账号即回到正常模式。添加账号页（[onGuestEnter] = null）不显示本入口
+ *  —— 那个场景下「不登录」语义不通。
  */
 @Composable
 fun LoginQrScreen(
     onLoggedIn: () -> Unit,
     heading: String = "网易云扫码登录",
+    onGuestEnter: (() -> Unit)? = null,
 ) {
     var qrContent by remember { mutableStateOf<String?>(null) }
     var status by remember { mutableStateOf("正在获取二维码…") }
@@ -115,28 +123,62 @@ fun LoginQrScreen(
         }
     }
 
+    if (com.netmusiclite.data.AppearancePrefs.isM3e) {
+        com.netmusiclite.ui.m3e.M3eLoginQr(heading, qrContent, status, scanned, onGuestEnter)
+        return
+    }
+
     Box(
         Modifier
             .fillMaxSize()
             .background(screenBg()),
         contentAlignment = Alignment.Center,
     ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            // ★ 2026-10-06 底部「不登录进入音乐」入口占位：主内容整体上移 12dp，
+            //   二维码在圆表上仍远在弦长安全区内（153.6dp 宽卡中心 y≈-70dp 处弦长 >176dp）
+            modifier = Modifier.padding(bottom = if (onGuestEnter != null) 24.dp else 0.dp),
+        ) {
             Text(heading, fontSize = 15.sp, color = TextPrimary, textAlign = TextAlign.Center, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold)
-            Spacer(Modifier.height(14.dp))
+            // ★ 2026-10-02 用户口径「登录二维码调大 20%」：128dp → 153.6dp（遮罩/对勾同步放大）。
+            //   233dp 圆屏上 163.6dp 白卡的四角距圆心 115.7dp < 半径 116.5dp，不会被圆裁切；
+            //   两处 Spacer 14→10dp 抵消增高，保证「网络异常」两行状态字时也不顶出屏幕。
+            Spacer(Modifier.height(10.dp))
             Box(contentAlignment = Alignment.Center) {
-                QrCodeImage(qrContent ?: "", 128.dp)
+                QrCodeImage(qrContent ?: "", 153.6.dp)
                 if (scanned) {
                     Box(
-                        Modifier.size(128.dp).clip(CircleShape).background(Color.Black.copy(alpha = 0.72f)),
+                        Modifier.size(153.6.dp).clip(CircleShape).background(Color.Black.copy(alpha = 0.72f)),
                         contentAlignment = Alignment.Center,
                     ) {
-                        Icon(NcmIcons.Check, null, tint = Green, modifier = Modifier.size(44.dp))
+                        Icon(NcmIcons.Check, null, tint = Green, modifier = Modifier.size(52.dp))
                     }
                 }
             }
-            Spacer(Modifier.height(14.dp))
+            Spacer(Modifier.height(10.dp))
             Text(status, fontSize = 10.sp, color = TextSecondary, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth().padding(horizontal = 44.dp))
+        }
+        // ★ 2026-10-06 访客入口：底部小胶囊（玻璃材质，与全站卡片观感一致）。
+        //   位置压在屏幕下缘（bottom 10dp，此处圆弦宽约 112dp > 胶囊约 98dp，不会被圆裁切）。
+        if (onGuestEnter != null) {
+            val guestInteraction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
+            Text(
+                "不登录进入音乐",
+                fontSize = 10.sp,
+                color = TextSecondary,
+                maxLines = 1,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 10.dp)
+                    .clip(androidx.compose.foundation.shape.RoundedCornerShape(50))
+                    .frostedGlass(androidx.compose.foundation.shape.RoundedCornerShape(50))
+                    .clickable(
+                        interactionSource = guestInteraction,
+                        indication = null,
+                    ) { onGuestEnter() }
+                    .padding(horizontal = 14.dp, vertical = 6.dp),
+            )
         }
     }
 }

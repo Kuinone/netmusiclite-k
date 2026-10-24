@@ -3,6 +3,8 @@ package com.netmusiclite.ui.screens.record
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -22,6 +24,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -31,6 +37,7 @@ import com.netmusiclite.data.PageCache
 import com.netmusiclite.data.PlayRecord
 import com.netmusiclite.data.PlayerEngine
 import com.netmusiclite.data.SessionStore
+import com.netmusiclite.ui.components.pressStretch
 import com.netmusiclite.ui.components.CenterHint
 import com.netmusiclite.ui.components.SongCover
 import com.netmusiclite.ui.components.StackedCard
@@ -40,9 +47,11 @@ import com.netmusiclite.ui.nav.NavMotionKind
 import com.netmusiclite.ui.nav.navigateWithMotion
 import com.netmusiclite.ui.theme.Accent
 import com.netmusiclite.ui.theme.AccentSoft
+import com.netmusiclite.ui.theme.OnAccent
 import com.netmusiclite.ui.theme.SurfaceGlass
 import com.netmusiclite.ui.theme.TextPrimary
 import com.netmusiclite.ui.theme.TextSecondary
+import com.netmusiclite.ui.theme.isLightTheme
 
 /** 听歌排行：本周 / 所有时间，每项显示播放次数（数据走 PageCache，10 分钟内不重拉；
  *  每次听歌上报成功会主动失效缓存，进页即见最新次数） */
@@ -58,30 +67,55 @@ fun RecordScreen(nav: NavHostController) {
         loading = false
     }
 
+    val switchTextStyle = androidx.compose.material3.LocalTextStyle.current.copy(
+        fontSize = 11.sp, fontWeight = FontWeight.Bold,
+    )
+    val switchTextHeight = rememberTextMeasurer().measure("全部时间", style = switchTextStyle).size.height
+    // Keep the original line height plus 4dp padding on each edge, then increase by 20%.
+    val switchHeight = with(LocalDensity.current) { (switchTextHeight.toDp() + 8.dp) * 1.2f }
     StackedCardList(title = "听歌排行", progressTotal = records.size + 2, horizontalInsetPx = 10) {
         item(key = "switch") {
+            if (com.netmusiclite.data.AppearancePrefs.isM3e) {
+                com.netmusiclite.ui.m3e.M3eRecordPeriodSwitch(type, height = switchHeight) { type = it }
+            } else {
             Row(
-                Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                horizontalArrangement = androidx.compose.foundation.layout.Arrangement.Center,
+                Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
                 listOf(1 to "本周", 0 to "全部时间").forEach { (t, label) ->
                     val selected = type == t
-                    Text(
-                        label,
-                        fontSize = 11.sp,
-                        color = if (selected) Accent else TextPrimary,
-                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
-                        modifier = Modifier
-                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                    val light = isLightTheme
+                    Box(
+                        modifier = Modifier.weight(1f).height(switchHeight).pressStretch()
                             .clip(RoundedCornerShape(50))
-                            .background(if (selected) AccentSoft else SurfaceGlass)
+                            .background(
+                                if (selected) {
+                                    if (light) Accent else AccentSoft
+                                } else {
+                                    if (light) Color.White else SurfaceGlass
+                                }
+                            )
                             .clickable(
                                 interactionSource = remember { MutableInteractionSource() },
                                 indication = null,
-                            ) { type = t }
-                            .padding(horizontal = 12.dp, vertical = 4.dp),
-                    )
+                            ) { type = t },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            label,
+                            fontSize = 11.sp,
+                            color = if (selected) {
+                                if (light) OnAccent else Accent
+                            } else TextPrimary,
+                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                            modifier = Modifier.fillMaxWidth(),
+                            textAlign = TextAlign.Center,
+                            maxLines = 1,
+                        )
+                    }
                 }
+            }
             }
         }
         if (loading) {
@@ -119,11 +153,23 @@ fun RecordScreen(nav: NavHostController) {
                             r.song.title, fontSize = 12.sp, color = TextPrimary,
                             fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis,
                         )
-                        Text(
-                            "${r.song.artist} · 播放 ${r.playCount} 次",
-                            fontSize = 9.sp, color = TextSecondary, maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
+                        // 次数固定右端（2026-10-02 用户选定）：歌手名各自省略，播放次数绝不被挤出。
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                r.song.artist,
+                                fontSize = 9.sp, color = TextSecondary,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                "播放 ${r.playCount} 次",
+                                fontSize = 9.sp, color = TextSecondary, maxLines = 1,
+                            )
+                        }
                     }
                 }
             }

@@ -25,7 +25,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
+import com.netmusiclite.ui.m3e.AdaptiveLazyColumn as LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -100,6 +100,14 @@ import com.netmusiclite.ui.nav.TransitionCoordinator
 
  */
 
+/**
+ * 视口高 = **设计基准屏短边** 233dp（466px @ density 2.0）。
+ *
+ * ⚠ 不要换成 `LocalConfiguration.screenHeightDp`：NcmTheme 已按「屏宽 / 233dp」等比缩放了
+ *   LocalDensity（见 ui/theme/Theme.kt 的 uiScale），**UI 坐标系里屏幕短边恒为 233dp** ——
+ *   这个常量在任何屏上都正好等于真实视口高。而系统 screenHeightDp 是「系统 dp」，
+ *   缩放后不再等于屏宽，用它反而会算错（同 Common.kt 的 screenWidthUiDp 注释）。
+ */
 val STACKED_VIEWPORT = 233.dp
 
 /**
@@ -120,6 +128,7 @@ private val EDGE_REBOUND = tween<Float>(320, easing = CubicBezierEasing(0.30f, 1
  */
 @Composable
 fun Modifier.sinkFromCenter(): Modifier {
+    if (com.netmusiclite.data.AppearancePrefs.isM3e) return this
     val density = LocalDensity.current
     val half = with(density) { (STACKED_VIEWPORT / 2).toPx() }
     var centerY by remember { mutableFloatStateOf(half) }
@@ -153,13 +162,19 @@ fun StackedCardList(
     horizontalInsetPx: Int = 0,
     content: LazyListScope.() -> Unit,
 ) {
+    if (com.netmusiclite.data.AppearancePrefs.isM3e) {
+        com.netmusiclite.ui.m3e.M3eList(title = title, modifier = modifier, state = state, content = content)
+        return
+    }
     // 上下各留 (视口 - 卡高)/2：首尾卡片也能滚动到正中
     val centerPad = (viewportHeight - cardHeight) / 2
     val insetDp = with(LocalDensity.current) { horizontalInsetPx.toFloat().toDp() }
     // 2026-10-01：标题胶囊整体缩小 10% + 上移 10 像素（用户口径为物理像素，按 density 折算）
     val titleLiftDp = with(LocalDensity.current) { 10f.toDp() }
     // 卡片横向宽度：收窄 10% 后按用户要求加宽 6% → 净宽 95.4% 屏宽（每边收窄 2.3%）
-    val screenWidthDp = androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp
+    // ⚠ 用 screenWidthUiDp（UI 坐标系屏宽）：密度被 NcmTheme 等比缩放后，
+    //   LocalConfiguration.screenWidthDp 不再等于屏宽，收窄量会算错（见 Common.kt 注释）
+    val screenWidthDp = screenWidthUiDp().value
     val widthShrink = (screenWidthDp * 0.023f).dp
 
     // 零分配进度估算：只用 snapshot int（index+offset），滚动中不产生 layoutInfo 分配，避免 GC 抖动
@@ -169,8 +184,8 @@ fun StackedCardList(
         derivedStateOf {
             if (progressTotal <= 1) 0.15f
             else {
-                val idx = state.firstVisibleItemIndex +
-                    (state.firstVisibleItemScrollOffset / pitchPx).coerceAtMost(1f)
+                val idx = com.netmusiclite.ui.m3e.listFirstIndex(state) +
+                    (com.netmusiclite.ui.m3e.listFirstOffset(state) / pitchPx).coerceAtMost(1f)
                 ((idx - 0.5f) / (progressTotal - 1)).coerceIn(0.15f, 1f)
             }
         }
@@ -367,6 +382,15 @@ fun ListFilterCard(query: String, onQuery: (String) -> Unit, modifier: Modifier 
                 modifier = Modifier
                     .weight(1f)
                     .focusRequester(focusRequester),
+                // ★ 2026-10-24 用户需求：搜索框恢复「搜点什么」占位（单行，不改变行高）。
+                decorationBox = { inner ->
+                    Box {
+                        if (query.isEmpty()) {
+                            Text("搜点什么", fontSize = 11.sp, color = TextSecondary)
+                        }
+                        inner()
+                    }
+                },
             )
             Icon(
                 NcmIcons.Close, "收起", tint = TextSecondary,
@@ -404,6 +428,11 @@ fun StackedCard(
     contentPadding: PaddingValues = PaddingValues(horizontal = 16.dp),
     content: @Composable RowScope.() -> Unit,
 ) {
+    if (com.netmusiclite.data.AppearancePrefs.isM3e) {
+        com.netmusiclite.ui.m3e.M3eRowCard(modifier, onClick, onLongClick, height, contentPadding, content)
+        return
+    }
+
     val shape = RoundedCornerShape(cornerRadius)
     val src = remember { MutableInteractionSource() }
     val coordinates = remember { mutableStateOf<LayoutCoordinates?>(null) }
@@ -421,8 +450,8 @@ fun StackedCard(
             .sinkFromCenter()
             .graphicsLayer {
                 // 按压缩放走图层属性延迟读取：动画期间零重组（W5 流畅度）
-                scaleX = s
-                scaleY = s
+                scaleX = PressMotion.stretchX(s)
+                scaleY = PressMotion.stretchY(s)
             }
             .clip(shape)
             .frostedGlass(shape)
@@ -464,6 +493,11 @@ fun StackedIconCard(
     navMotionKind: NavMotionKind? = null,
     onClick: () -> Unit = {},
 ) {
+    if (com.netmusiclite.data.AppearancePrefs.isM3e) {
+        com.netmusiclite.ui.m3e.M3eIconCard(title, icon, subtitle, modifier, onClick)
+        return
+    }
+
     StackedCard(modifier = modifier, onClick = onClick, navMotionKind = navMotionKind, height = height) {
         Box(
             Modifier
@@ -501,6 +535,11 @@ fun StackedSongCard(
     /** 跨语言搜索命中别名时展示的译名（见 [SongRow] 的同名参数） */
     aliasHint: String? = null,
 ) {
+    if (com.netmusiclite.data.AppearancePrefs.isM3e) {
+        com.netmusiclite.ui.m3e.M3eSongCard(song, onClick, modifier, isCurrent, onLongClick, selectMode, selected, aliasHint)
+        return
+    }
+
     StackedCard(
         modifier = modifier,
         onClick = onClick,

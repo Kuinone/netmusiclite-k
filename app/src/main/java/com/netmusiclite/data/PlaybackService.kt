@@ -39,11 +39,28 @@ class PlaybackService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // ★ 2026-10-23「暂停后熄屏，亮屏有概率自动开始播放」排查落点：
+        //   本服务是**唯一**由 PendingIntent 驱动播放动作的地方（通知栏三个键）。
+        //   系统在某些 ROM 上会缓存/重放通知上的 PendingIntent（亮屏重新下发通知时尤其常见），
+        //   那条 ACTION_PLAY 与「用户真的点了播放键」在这里**长得一模一样**。
+        //   处理原则（两层）：
+        //    ① 只在 intent 确实带播放/暂停/切歌 action 时驱动引擎 —— 系统重建服务时
+        //       intent 为 null（START_NOT_STICKY 下本不该发生，ROM 强拉时可能），此时一律不碰
+        //       播放状态，只按引擎的真实意图决定前台服务去留；
+        //    ② 「非用户来源的起播」由 PlayerEngine.shouldBlockSystemResume 统一拦截
+        //       （亮屏 800ms 内 / 进程冷启动 3s 内 / 熄屏时丢弃），日志在 PlayDiag 里查。
         when (intent?.action) {
-            ACTION_PLAY -> PlayerEngine.playAction()
+            ACTION_PLAY -> PlayerEngine.playAction("notification")
             ACTION_PAUSE -> PlayerEngine.pauseAction()
             ACTION_NEXT -> PlayerEngine.next()
             ACTION_PREV -> PlayerEngine.prev()
+            else -> {
+                // 包括 intent == null：不驱动任何播放动作
+                android.util.Log.i(
+                    "PlayDiag",
+                    "service start no-op action=${intent?.action} active=${PlayerEngine.playbackActive}",
+                )
+            }
         }
         if (PlayerEngine.playbackActive) {
             startForeground(NOTIF_ID, buildNotification())
@@ -77,6 +94,11 @@ class PlaybackService : Service() {
         }
         val song = PlayerEngine.current
         val playing = PlayerEngine.isPlaying
+        val m3e = AppearancePrefs.isM3e
+        val previousIcon = if (m3e) R.drawable.ic_m3e_notif_prev else R.drawable.ic_notif_prev
+        val playIcon = if (m3e) R.drawable.ic_m3e_notif_play else R.drawable.ic_notif_play
+        val pauseIcon = if (m3e) R.drawable.ic_m3e_notif_pause else R.drawable.ic_notif_pause
+        val nextIcon = if (m3e) R.drawable.ic_m3e_notif_next else R.drawable.ic_notif_next
         val contentPi = PendingIntent.getActivity(
             this, 0,
             Intent(this, MainActivity::class.java)
@@ -98,15 +120,15 @@ class PlaybackService : Service() {
             .setOnlyAlertOnce(true)
             .setOngoing(true)
             .addAction(Notification.Action.Builder(
-                Icon.createWithResource(this, R.drawable.ic_notif_prev), "上一首", cmd(ACTION_PREV)).build())
+                Icon.createWithResource(this, previousIcon), "上一首", cmd(ACTION_PREV)).build())
             .addAction(Notification.Action.Builder(
                 Icon.createWithResource(
-                    this, if (playing) R.drawable.ic_notif_pause else R.drawable.ic_notif_play),
+                    this, if (playing) pauseIcon else playIcon),
                 if (playing) "暂停" else "播放",
                 cmd(if (playing) ACTION_PAUSE else ACTION_PLAY),
             ).build())
             .addAction(Notification.Action.Builder(
-                Icon.createWithResource(this, R.drawable.ic_notif_next), "下一首", cmd(ACTION_NEXT)).build())
+                Icon.createWithResource(this, nextIcon), "下一首", cmd(ACTION_NEXT)).build())
         PlayerEngine.mediaSessionToken?.let { token ->
             builder.setStyle(
                 Notification.MediaStyle().setMediaSession(token).setShowActionsInCompactView(0, 1, 2),

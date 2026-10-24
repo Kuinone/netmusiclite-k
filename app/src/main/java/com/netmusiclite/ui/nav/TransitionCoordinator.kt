@@ -1,4 +1,6 @@
 package com.netmusiclite.ui.nav
+import com.netmusiclite.data.CrashLogger
+import com.netmusiclite.ui.components.pressStretch
 
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -30,10 +32,21 @@ enum class NavMotionKind {
      *   只有 Slide 走滑动转场，其余（Pill / Circle / Directional）一律走统一缩放。
      */
     Slide,
+
+    /**
+     * 竖向滑动来源：下滑进评论页（2026-10-03 用户要求「进入评论区从上方往下滑入」）。
+     * 与 [Slide] 同为滑动来源 —— 动画曲线/时长一个字不改（NavGlide / NAV_MS），
+     * 只是把传送带从横向换成竖向：入页从屏幕上方往下滑入、旧页同向往下滑出；
+     * 返回方向整条反向（评论页往上滑出、播放页从下方滑回）。
+     */
+    SlideV,
     ;
 
-    /** 是否滑动来源 —— 只有 [Slide] 保留「传送带」滑动转场，其余一律缩放。 */
-    val isSwipe: Boolean get() = this == Slide
+    /** 是否滑动来源 —— [Slide]/[SlideV] 保留「传送带」滑动转场，其余一律缩放。 */
+    val isSwipe: Boolean get() = this == Slide || this == SlideV
+
+    /** 是否竖向滑动 —— 渲染层据此选 slideIn/OutVertically 而非 Horizontally。 */
+    val isVertical: Boolean get() = this == SlideV
 }
 
 /** Origin is stored as a fraction of the NavHost viewport, so it survives size and density changes. */
@@ -60,9 +73,45 @@ object TransitionCoordinator {
     private const val GESTURE_POP_KEY = "wm_nav_gesture_pop"
     private const val GESTURE_EXIT_MS_KEY = "wm_nav_gesture_pop_exit_ms"
 
+    /**
+     * 触点缩放原点（2026-10-02 用户要求「所有缩放动画打开中心由使用场景点击位置而定」）：
+     * NavHost 层有一个被动触点观察者（见 AppNav 的 pointerInput），把每次按下的位置
+     * 归一化后记在这里；点击导航时 `navigateWithMotion` 优先取这份**新鲜**触点作为
+     * 缩放原点 —— 一处采集覆盖全部点击入口，不用逐个调用点传位置。
+     *
+     * ★ 超窗回退：距按下超过 [TAP_FRESH_MS] 的旧触点视为与本次导航无关（登录扫码完成、
+     *   登出后的 backToHome 等异步跳转），回退到 spec 自带原点（控件中心采集）或屏幕中心。
+     */
+    private const val TAP_FRESH_MS = 1000L
+    private var tapX = 0.5f
+    private var tapY = 0.5f
+    private var tapAtMs = 0L
+
     private var hostCoordinates: LayoutCoordinates? = null
     private var armedSpec: NavMotionSpec? = null
     private var navController: NavHostController? = null
+
+    /** 记录一次按下的归一化位置（由 NavHost 层触点观察者调用；仅观察，不消费事件）。 */
+    fun noteTap(x: Float, y: Float) {
+        tapX = x.normalizedFraction()
+        tapY = y.normalizedFraction()
+        tapAtMs = android.os.SystemClock.uptimeMillis()
+    }
+
+    /**
+     * 松手时刷新新鲜度（位置不变，仍是按下点）：慢点击（按住超过 [TAP_FRESH_MS] 才松手）
+     * 也按「本次点击」计算；异步跳转（扫码完成、登出回主页）距松手已很久，照旧超窗回退。
+     */
+    fun markTapFresh() {
+        if (tapAtMs != 0L) tapAtMs = android.os.SystemClock.uptimeMillis()
+    }
+
+    /** 新鲜触点原点（超窗/未记录返回 null） */
+    fun freshTapOrigin(): Pair<Float, Float>? {
+        if (tapAtMs == 0L) return null
+        if (android.os.SystemClock.uptimeMillis() - tapAtMs > TAP_FRESH_MS) return null
+        return tapX to tapY
+    }
 
     fun updateViewport(coordinates: LayoutCoordinates) {
         hostCoordinates = coordinates.takeIf { it.isAttached }
@@ -130,6 +179,16 @@ object TransitionCoordinator {
         entry.savedStateHandle.remove<Boolean>(GESTURE_POP_KEY)
     }
 
+    /**
+     * 当前栈顶页的转场规格（含入场时记录的缩放原点）。
+     *
+     * ★ 2026-10-02：右滑返回的**跟手缩放/收场缩放**（SwipeBackFader 各使用点）用它做
+     *   graphicsLayer 的 transformOrigin —— 退出才能「原路返回」（缩回当初点进来的位置），
+     *   否则默认中心原点会让页面缩向屏幕正中，与入场的触点缩放不对称（用户实测反馈）。
+     */
+    fun currentSpec(): NavMotionSpec? =
+        navController?.currentBackStackEntry?.let { read(it) }
+
     fun read(entry: NavBackStackEntry): NavMotionSpec {
         val kind = runCatching {
             NavMotionKind.valueOf(entry.savedStateHandle.get<String>(KIND_KEY) ?: "")
@@ -167,6 +226,7 @@ object TransitionCoordinator {
      * exitDurationMs 同时落到该 back-stack entry 上，供 popEnter/popExit 转场读取对齐时长。
      */
     fun <T> withGesturePop(exitDurationMs: Int, action: () -> T): T {
+        CrashLogger.step("gesture pop ${exitDurationMs}ms")
         val controller = navController
         val outgoing = controller?.currentBackStackEntry
         if (outgoing != null) {
@@ -197,6 +257,7 @@ fun Modifier.navMotionSource(
     val source = interactionSource ?: remember { MutableInteractionSource() }
     this
         .onGloballyPositioned { coordinates.value = it }
+        .pressStretch(interactionSource = source)
         .clickable(interactionSource = source, indication = indication) {
             TransitionCoordinator.withSource(kind, coordinates.value, onNavigate)
         }
@@ -208,9 +269,15 @@ fun NavHostController.navigateWithMotion(
     spec: NavMotionSpec? = null,
     builder: NavOptionsBuilder.() -> Unit = {},
 ) {
-    val stableSpec = (spec ?: TransitionCoordinator.consumeArmedOrDirectional()).normalized()
+    val base = (spec ?: TransitionCoordinator.consumeArmedOrDirectional()).normalized()
+    // ★ 2026-10-02：缩放原点 = 使用场景点击位置（手指触点）。新鲜触点优先于显式 spec
+    //   和控件中心采集；滑动来源不缩放（传送带），无需原点。超窗旧触点已在
+    //   freshTapOrigin 内回退 null → 保留 base 自带原点（控件中心 / 屏幕正中）。
+    val tap = if (base.kind.isSwipe) null else TransitionCoordinator.freshTapOrigin()
+    val stableSpec = if (tap != null) base.copy(originX = tap.first, originY = tap.second) else base
     navigate(route, builder)
     currentBackStackEntry?.let { TransitionCoordinator.write(it, stableSpec) }
+    CrashLogger.step("nav → $route (${stableSpec.kind.name})")
 }
 
 private fun Float.normalizedFraction(): Float =

@@ -61,8 +61,14 @@ object PageCache {
     suspend fun userPlaylists(uid: Long): List<PlaylistItem> {
         if (uid == playlistsUid) playlists?.let { return it }
         val fresh = NcmApi.userPlaylists(uid)
-        if (fresh.isNotEmpty()) { playlists = fresh; playlistsUid = uid }
-        return fresh
+        if (fresh.isNotEmpty()) {
+            playlists = fresh; playlistsUid = uid
+            OfflineCache.savePlaylists(fresh)   // 离线缓存：断网时歌单列表仍可用
+        } else if (playlists == null) {
+            // 拉取失败（断网）→ 上次缓存快照兜底
+            OfflineCache.loadPlaylists()?.let { playlists = it; playlistsUid = uid }
+        }
+        return playlists ?: fresh
     }
 
     // ---------- 收藏的专辑（2026-09-30：「我创建的歌单」页新增「收藏的专辑」分栏）----------
@@ -86,22 +92,62 @@ object PageCache {
             size > DETAIL_MAX
     }
 
-    suspend fun albumDetail(id: Long): Triple<String, String?, List<Song>>? {
+    suspend fun albumDetail(id: Long): NcmApi.AlbumDetail? {
         synchronized(details) {
-            (details["al:$id"] as? Triple<String, String?, List<Song>>)?.let { return it }
+            (details["al:$id"] as? NcmApi.AlbumDetail)?.let { return it }
         }
         val fresh = NcmApi.albumDetail(id) ?: return null
         synchronized(details) { details["al:$id"] = fresh }
         return fresh
     }
 
+    /** 专辑收藏/取消收藏后调用：详情缓存（含 subscribed 收藏态）下次重新拉取 */
+    fun invalidateAlbumDetail(id: Long) { synchronized(details) { details.remove("al:$id") } }
+
     suspend fun playlistDetail(id: Long): Pair<PlaylistItem, List<Song>>? {
         synchronized(details) {
             (details["pl:$id"] as? Pair<PlaylistItem, List<Song>>)?.let { return it }
         }
-        val fresh = NcmApi.playlistDetail(id) ?: return null
-        synchronized(details) { details["pl:$id"] = fresh }
+        val fresh = NcmApi.playlistDetail(id)
+        if (fresh != null) {
+            synchronized(details) { details["pl:$id"] = fresh }
+            // 离线缓存：点击过的歌单自动落盘（仅列表数据，非音频），断网可再进
+            OfflineCache.savePlaylistDetail(id, fresh.first, fresh.second)
+            return fresh
+        }
+        // 断网/失败兜底：吃上次点击时落盘的快照（红心标识由 PlayerEngine.likedIds 离线恢复）
+        return OfflineCache.loadPlaylistDetail(id)?.also { cached ->
+            synchronized(details) { details["pl:$id"] = cached }
+        }
+    }
+
+    // ---------- 艺人页（2026-10-07）----------
+    // 进入即拉「热歌 + 专辑 + 关注态」一整包；用户口径「点专辑进详情后返回应回到专辑页」——
+    // 返回时吃缓存原样还原（tab 由 rememberSaveable 恢复、数据由这里恢复），
+    // 不重拉、列表不闪「加载中/暂无专辑」。与专辑/歌单详情同款 LRU 策略。
+    // 关注态写穿：用户在艺人页点关注/取消后由 [setArtistFollowing] 同步覆盖，
+    // 返回不会闪旧值；拉取失败（page == null）不落缓存，下次进入重试。
+    suspend fun artistBundle(id: Long): Triple<NcmApi.ArtistPage?, List<AlbumItem>, Boolean>? {
+        synchronized(details) {
+            @Suppress("UNCHECKED_CAST")
+            (details["ar:$id"] as? Triple<NcmApi.ArtistPage?, List<AlbumItem>, Boolean>)?.let { return it }
+        }
+        val page = runCatching { NcmApi.artistHot(id) }.getOrNull()
+        val albums = runCatching { NcmApi.artistAlbums(id) }.getOrDefault(emptyList())
+        // 关注红心真实状态（旧版固定 false，已关注的艺人也显示未关注）
+        val following = runCatching { NcmApi.artistFollowed(id) }.getOrDefault(false)
+        val fresh = Triple(page, albums, following)
+        if (page != null) synchronized(details) { details["ar:$id"] = fresh }
         return fresh
+    }
+
+    /** 关注态写穿（艺人页点关注/取消及其失败回滚时调用），保证返回艺人页时红心不闪旧值 */
+    fun setArtistFollowing(id: Long, following: Boolean) {
+        synchronized(details) {
+            @Suppress("UNCHECKED_CAST")
+            val cur = details["ar:$id"] as? Triple<NcmApi.ArtistPage?, List<AlbumItem>, Boolean> ?: return
+            details["ar:$id"] = Triple(cur.first, cur.second, following)
+        }
     }
 
     // ---------- 听歌排行（10 分钟 TTL：页面秒开，又不至于「听完歌次数不变」。
@@ -154,6 +200,12 @@ object PageCache {
 
     /** 发送消息/分享歌曲后调用：会话的 lastText/未读已变化，下次强制重拉 */
     fun invalidateMsgSessions() { sessionsList = emptyList(); sessionsAt = 0L }
+
+    /** 私信已读上报成功后调用：缓存里该会话的未读先归零（返回列表秒显），并强制下次以服务端为准 */
+    fun markSessionRead(uid: Long) {
+        sessionsList = sessionsList.map { if (it.userId == uid) it.copy(unread = 0) else it }
+        sessionsAt = 0L
+    }
 
     suspend fun friends(uid: Long): List<FriendInfo> {
         if (uid == friendsUid && friendsList.isNotEmpty() &&

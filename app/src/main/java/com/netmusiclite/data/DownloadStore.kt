@@ -20,7 +20,11 @@ import java.io.File
 
 /**
  * 下载管理：eapi download/url/v1 取直链 → 流式落盘到应用私有 Music 目录。
- * 音频(ncm_{id}.mp3)落盘后连带歌词(.lrc)、注音(.roma)、封面(.jpg)一并保存，
+ *
+ * 音频文件名为 `ncm_{id}.{flac|m4a|mp3}` —— **扩展名跟直链实际格式走**（2026-10-18 起）：
+ * 无损档（QualityPrefs=lossless）请求 FLAC，落盘 `.flac`；有损档落 `.m4a`/`.mp3`。
+ * 老版本下载的文件一律是 `.mp3`，[audioFileFor] 按扩展名白名单查找，旧文件照常能播、能删。
+ * 音频落盘后连带歌词(.lrc)、注音(.roma)、封面(.jpg)一并保存，
  * 显示端断网时全部离线可用。states: 0未下载 / 1下载中 / 2已下载。
  * 已下载索引持久化(songs.json)，供本地音乐页与离线播放。
  */
@@ -55,6 +59,18 @@ object DownloadStore {
     var failedVersion by mutableStateOf(0)
         private set
 
+    // 速度/进度统计（2026-10-03 下载管理页速度胶囊）：普通 @Volatile 而非 Compose 态——
+    // 复制循环按 64KB 块高频自增，若走 Snapshot 态会按块触发全页重组。UI 侧自行 500ms 采样差值。
+    @Volatile var bytesReadTotal = 0L      // 进程内累计下载字节（UI 采样差值算瞬时速度）
+        private set
+    @Volatile var currentBytes = 0L        // 当前歌曲已接收字节
+        private set
+    @Volatile var currentTotal = 0L        // 当前歌曲总字节（Content-Length，未知为 0）
+        private set
+
+    // 协作取消集合：长按删除下载中的歌时标记，复制循环逐块检查后中止并清理半截文件
+    private val cancelRequests = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
+
     /** 锁保护下的待下载队列快照（主线程组合遍历用） */
     fun pendingCopy(): List<Song> = synchronized(queueLock) { pendingQueue.toList() }
 
@@ -87,6 +103,20 @@ object DownloadStore {
             l
         }
         if (leftovers.isNotEmpty()) enqueue(leftovers)
+    }
+
+    /**
+     * 移除下载任务（2026-10-03 下载管理页长按多选删除）：排队中的直接出队；
+     * 正在下载的写取消标记，复制循环逐块检查后中止并删除半截文件（见 download）。
+     * 失败条目一并清除。已下载(states==2)不在此处处理——失败条目之外的都是任务态。
+     */
+    fun removeTasks(ids: Collection<Long>) {
+        if (ids.isEmpty()) return
+        synchronized(queueLock) {
+            if (pendingQueue.removeAll { it.id in ids }) pendingVersion++
+            if (failed.keys.removeAll { it in ids }) failedVersion++
+        }
+        if (currentDownload?.id in ids) cancelRequests.add(currentDownload!!.id)
     }
 
     fun init(context: Context) {
@@ -147,10 +177,33 @@ object DownloadStore {
         }
     }
 
+    /** 音频文件扩展名白名单：无损 flac / 有损 m4a、mp3（少数 CDN 回 aac/ogg 后缀也收） */
+    private val AUDIO_EXTS = listOf("flac", "m4a", "mp3", "aac", "ogg")
+
+    /**
+     * 该歌曲已落盘的音频文件（任意格式）。
+     *
+     * ★ 2026-10-18：扩展名不再固定 mp3 —— 无损档下载 FLAC 会落成 `ncm_{id}.flac`；
+     *   播放/删除/断点判断统一走这里按白名单查找，**旧版本下载的 .mp3 仍然兼容**。
+     */
+    fun audioFileFor(id: Long): File? {
+        for (ext in AUDIO_EXTS) {
+            val f = File(dir(), "ncm_${id}.$ext")
+            if (f.exists() && f.length() > 0L) return f
+        }
+        return null
+    }
+
+    /** 直链后缀 → 落盘扩展名；认不出来按 mp3（老行为兜底） */
+    private fun audioExtOf(url: String): String {
+        val name = url.substringBefore('?').substringAfterLast('/').lowercase()
+        val ext = name.substringAfterLast('.', "")
+        return if (ext in AUDIO_EXTS) ext else "mp3"
+    }
+
     fun fileFor(id: Long): File? {
-        val s = index[id] ?: return null
-        val f = File(dir(), "ncm_${id}.mp3")
-        return if (f.exists() && f.length() > 0) f else null
+        if (!index.containsKey(id)) return null
+        return audioFileFor(id)
     }
 
     fun localFile(context: Context, id: Long): File? = fileFor(id)
@@ -199,29 +252,24 @@ object DownloadStore {
     /**
      * 本地 lrc（随下载落盘的合并歌词：原文行 + 同时间戳译文行）→ (歌词行, 译文表)。
      * 已下载歌曲断网/省流量时歌词离线可用；无本地文件返回 null。
+     *
+     * ★ 2026-10-22（Lead 授权，用户口径⑨收尾）：解析统一转调 [LocalLyricStore.parse]，
+     *   不再在这里维护第二份实现。
+     *   原因：本地导入歌曲（LocalLyricStore）已支持 A2（`<mm:ss.xx>字`）与行内标签
+     *   （`[mm:ss.xx]字`）两种**逐字 lrc**，而这里旧实现用 `tag.replace(...)` 消标签 ——
+     *   行内的逐字时间标签会被当成正文/重复时间戳，下载歌曲的逐字 lrc 永远只有整行。
+     *   转调后两条路径同一套三分流解析：普通行行为不变（同时间戳第二行 = 译文、
+     *   内容相同视为重复行防「歌词重影」），逐字行产出 [LyricLine.words] → 歌词页直接逐字点亮。
+     *   本函数仍只在「本地文件存在」时返回非 null（网络歌词兜底在 LyricsScreen 的 null 分支），
+     *   既有分支语义不变；编码改走 [LocalLyricStore.decodeBytes]（带 GBK 兜底，比旧 readLines 稳）。
      */
     fun localLyric(id: Long): Pair<List<LyricLine>, Map<Long, String>>? {
         val f = File(dir(), "ncm_${id}.lrc")
         if (!f.exists() || f.length() <= 0L) return null
         return runCatching {
-            val tag = Regex("""\[(\d{1,2}):(\d{1,2})(?:[.:](\d{1,3}))?]""")
-            val lines = ArrayList<LyricLine>()
-            val trans = HashMap<Long, String>()
-            var prevKey = -1L
-            f.readLines().forEach { raw ->
-                val m = tag.find(raw) ?: return@forEach
-                val key = m.groupValues[1].toLong() * 60000 + m.groupValues[2].toLong() * 1000 +
-                    fracMs(m.groupValues[3])
-                val text = tag.replace(raw, "").trim()
-                if (text.isEmpty()) return@forEach
-                if (key == prevKey && lines.isNotEmpty()) {
-                    trans[key] = text          // 同时间戳第二行 = 译文
-                } else {
-                    lines.add(LyricLine(key, text))
-                    prevKey = key
-                }
-            }
-            if (lines.isEmpty()) null else lines to trans
+            val raw = LocalLyricStore.decodeBytes(f.readBytes())
+            val parsed = LocalLyricStore.parse(raw, songOf(id)?.durationMs ?: 0)
+            if (parsed.first.isEmpty()) null else parsed
         }.getOrNull()
     }
 
@@ -245,7 +293,8 @@ object DownloadStore {
         states.remove(id)
         dlScope.launch(Dispatchers.IO) {
             runCatching {
-                File(dir(), "ncm_${id}.mp3").delete()
+                // 音频：删掉该 id 下所有已知扩展名（.flac/.m4a/.mp3…），不让残留文件占空间
+                AUDIO_EXTS.forEach { ext -> File(dir(), "ncm_${id}.$ext").delete() }
                 File(dir(), "ncm_${id}.lrc").delete()
                 File(dir(), "ncm_${id}.roma").delete()
                 File(dir(), "ncm_${id}.jpg").delete()
@@ -291,6 +340,10 @@ object DownloadStore {
             if (pendingQueue.removeAll { it.id == song.id }) pendingVersion++
             if (failed.remove(song.id) != null) failedVersion++
         }
+        cancelRequests.remove(song.id) // 清过期标记：取消后重下不被上一轮误伤
+        currentBytes = 0L
+        currentTotal = 0L
+        var aborted = false
         var failReason: String? = null
         val ok = withContext(Dispatchers.IO) {
             try {
@@ -312,30 +365,55 @@ object DownloadStore {
                             if (body == null) { failReason = "空响应"; false }
                             else {
                                 val tmp = File(dir(), "ncm_${song.id}.tmp")
+                                currentTotal = body.contentLength().coerceAtLeast(0L)
+                                // 64KB 块计数循环（替代 copyTo）：逐块累计速度字节 + 检查取消标记
+                                val buf = ByteArray(64 * 1024)
                                 body.byteStream().use { input ->
-                                    tmp.outputStream().use { output -> input.copyTo(output) }
-                                }
-                                val dst = File(dir(), "ncm_${song.id}.mp3")
-                                if (dst.exists()) dst.delete()
-                                tmp.renameTo(dst)
-                                val okFile = dst.exists() && dst.length() > 0
-                                if (!okFile) failReason = "落盘失败"
-                                // 音频落盘成功 → 同时下载歌词+注音文件（失败不影响下载成败）
-                                if (okFile) runCatching {
-                                    val b = NcmApi.lyricV1(song.id)
-                                    mergeLrc(b.lrc, b.trans)?.let { text ->
-                                        File(dir(), "ncm_${song.id}.lrc").writeText(text)
-                                    }
-                                    b.roma?.takeIf { it.isNotBlank() }?.let { r ->
-                                        File(dir(), "ncm_${song.id}.roma").writeText(r)
+                                    tmp.outputStream().use { output ->
+                                        while (true) {
+                                            if (song.id in cancelRequests) { aborted = true; break }
+                                            val n = input.read(buf)
+                                            if (n < 0) break
+                                            output.write(buf, 0, n)
+                                            currentBytes += n
+                                            bytesReadTotal += n
+                                        }
                                     }
                                 }
-                                // 音频落盘成功 → 封面一并落盘（失败不影响下载成败）：
-                                // 断网 / 清了应用缓存后，本地封面仍可显示、取色、做模糊头图
-                                if (okFile) song.coverUrl
-                                    ?.takeIf { it.isNotBlank() && !it.startsWith("local://") }
-                                    ?.let { fetchCover(song.id, it) }
-                                okFile
+                                if (aborted) {
+                                    tmp.delete() // 半截文件不落盘
+                                    false
+                                } else {
+                                    // ★ 2026-10-18：落盘扩展名跟直链实际格式走（无损档 = flac）。
+                                    //   旧实现写死 .mp3，无损下载也存成 mp3 后缀，外部播放器/扫码
+                                    //   识别会当成有损文件；现在 flac/m4a/mp3 各归其位，
+                                    //   audioFileFor() 读取时按白名单兼容旧文件。
+                                    val ext = audioExtOf(url)
+                                    val dst = File(dir(), "ncm_${song.id}.$ext")
+                                    if (dst.exists()) dst.delete()
+                                    // 同 id 的旧格式文件（例如曾经 .mp3 下载过）一并清掉，避免双份
+                                    AUDIO_EXTS.filter { it != ext }
+                                        .forEach { File(dir(), "ncm_${song.id}.$it").delete() }
+                                    tmp.renameTo(dst)
+                                    val okFile = dst.exists() && dst.length() > 0
+                                    if (!okFile) failReason = "落盘失败"
+                                    // 音频落盘成功 → 同时下载歌词+注音文件（失败不影响下载成败）
+                                    if (okFile) runCatching {
+                                        val b = NcmApi.lyricV1(song.id)
+                                        mergeLrc(b.lrc, b.trans)?.let { text ->
+                                            File(dir(), "ncm_${song.id}.lrc").writeText(text)
+                                        }
+                                        b.roma?.takeIf { it.isNotBlank() }?.let { r ->
+                                            File(dir(), "ncm_${song.id}.roma").writeText(r)
+                                        }
+                                    }
+                                    // 音频落盘成功 → 封面一并落盘（失败不影响下载成败）：
+                                    // 断网 / 清了应用缓存后，本地封面仍可显示、取色、做模糊头图
+                                    if (okFile) song.coverUrl
+                                        ?.takeIf { it.isNotBlank() && !it.startsWith("local://") }
+                                        ?.let { fetchCover(song.id, it) }
+                                    okFile
+                                }
                             }
                         }
                     }
@@ -346,6 +424,21 @@ object DownloadStore {
             }
         }
         currentDownload = null
+        currentBytes = 0L
+        currentTotal = 0L
+        // 取消（下载管理页长按删除）：清掉可能已落盘的音频+附属文件，状态回 0。
+        // 原因返回 null 与真实失败区分——enqueue 循环据此不把它计成失败。
+        if (cancelRequests.remove(song.id)) {
+            states[song.id] = 0
+            runCatching {
+                AUDIO_EXTS.forEach { ext -> File(dir(), "ncm_${song.id}.$ext").delete() }
+                File(dir(), "ncm_${song.id}.lrc").delete()
+                File(dir(), "ncm_${song.id}.roma").delete()
+                File(dir(), "ncm_${song.id}.jpg").delete()
+            }
+            onDone(false)
+            return false to null
+        }
         if (ok) {
             index[song.id] = song
             persist()
@@ -359,7 +452,7 @@ object DownloadStore {
             }
         }
         onDone(ok)
-        return ok to failReason
+        return ok to (if (ok) null else (failReason ?: "未知错误"))
     }
 
     /**
@@ -391,8 +484,14 @@ object DownloadStore {
                 // 撞上时会误记「正在下载中」失败条目
                 if (states[it.id] == 2) return@forEach
                 if (states[it.id] == 1 && currentDownload?.id != it.id) return@forEach
+                // 已被长按删除移出队列的歌：跳过不再开下（下载管理页 removeTasks）
+                if (!synchronized(queueLock) { pendingQueue.any { p -> p.id == it.id } }) return@forEach
                 val (ok, reason) = download(it)
-                if (ok) okN++ else reasons[reason ?: "未知错误"] = (reasons[reason ?: "未知错误"] ?: 0) + 1
+                when {
+                    ok -> okN++
+                    reason == null -> Unit // 取消（长按删除）不是失败
+                    else -> reasons[reason] = (reasons[reason] ?: 0) + 1
+                }
             }
             // failCount 按真实失败计数：暂停中断/跳过的歌不虚报为失败
             val failN = reasons.values.sum()

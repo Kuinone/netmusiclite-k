@@ -18,6 +18,42 @@ import java.io.File
 object BackgroundStore {
     private lateinit var prefs: SharedPreferences
 
+    /**
+     * 卡片取样底图的缓存文件名（名字里带引擎版本）。
+     *
+     * ★ 2026-10-16 从 `bg_blur_cards_v2` 升到 **v3**：换了模糊引擎（盒式近似 → Blurry 真高斯），
+     *   缓存判据只有「mtime ≥ 源图 mtime」，沿用旧名字会命中上一版盒式糊出来的旧底图 ——
+     *   换名字是最省事的失效手段（旧文件留在 cacheDir 由系统清理）。
+     *
+     * ★ 2026-10-16 二次（用户口径「现在冷启动好卡」）：v2 → v3 那次换名**踩了冷启动**——
+     *   换名 = 一次必然的缓存未命中，而旧逻辑「未命中就当场重算」的重算链路是
+     *   「**全分辨率**解码壁纸 → 裁方 → 缩 466 → RenderScript 真高斯 → JPEG 编码落盘」，
+     *   在手表上足以吃掉 1~3 秒 CPU，且正好落在冷启动最紧的窗口里（首启必卡）。
+     *   现在换成 **v4**，配套两条结构性修复：
+     *     ① 未命中时**不再当场重算**：先拿上一版引擎的缓存顶上（[LEGACY_CARD_BLUR_CACHES]），
+     *        重算延后 [STARTUP_DEFER_MS]（见 [loadCachedBlurred]）；
+     *     ② 重算链路的壁纸解码改为**按需降采样**（见 [decodeWallpaper]），
+     *        不再把 4000px 的整张原图解成 64MB 的 ARGB_8888。
+     *   ⇒ 以后无论怎么换名/换引擎，升级后的首启都不再付这笔钱。
+     */
+    private const val CARD_BLUR_CACHE = "bg_blur_cards_v4.jpg"
+
+    /** 上一版 / 上上版引擎产出的卡片底图（新缓存缺失时先顶上，避免升级后首启没有玻璃底） */
+    private val LEGACY_CARD_BLUR_CACHES =
+        listOf("bg_blur_cards_v3.jpg", "bg_blur_cards_v2.jpg")
+
+    /** 背景模糊底图的缓存名（与卡片底图分开；同样有「未命中延后重算」的保护） */
+    private const val BG_BLUR_CACHE = "bg_blur_bg.jpg"
+
+    /**
+     * 启动路径上「缓存未命中 → 重算」的延后时长：把重算挪出首帧/首屏最紧的窗口。
+     * 4s 足够让启动浮层揭开、首屏组合完成；重算本身仍在 `genExecutor` 后台线程上跑。
+     */
+    private const val STARTUP_DEFER_MS = 4_000L
+
+    /** 壁纸解码的目标长边（重算链路只产出 466 方图，留 2x 余量即可，不必解全图） */
+    private const val WALLPAPER_DECODE_TARGET = 1024
+
     var ready by mutableStateOf(false)
         private set
 
@@ -106,30 +142,55 @@ object BackgroundStore {
         }
     }
 
-    /** 启动即时毛玻璃：直接解码缓存底图（几十毫秒），缺失/过期才重新生成 */
+    /**
+     * 启动即时毛玻璃：只做「解码缓存底图」（几十毫秒），**绝不在启动窗口里重算**。
+     *
+     * ★ 2026-10-16 二次（用户口径「现在冷启动好卡」）—— 旧版这里未命中就 `regenerateBlurred()`，
+     *   而重算要「全分辨率解码壁纸 + RenderScript 真高斯 + JPEG 编码」，几秒钟 CPU 直接压在
+     *   冷启动上。现在拆成两条：
+     *     · 命中 → 解码（原路径，快）；
+     *     · 未命中 → ① 先用上一版引擎的缓存顶上（有就零成本），② 重算延后 [STARTUP_DEFER_MS]
+     *       再跑（那时启动已经结束，重算本身仍在 genExecutor 后台线程）。
+     *   背景模糊底图（bgBlur 滑杆）同款处理。
+     *
+     * ⚠ 换壁纸（[setFrom]）那条**立即重算**保持不变：那是用户主动动作，不在启动路径上，
+     *   延后反而会让用户看到旧壁纸的玻璃底。
+     */
     private fun loadCachedBlurred() {
         genExecutor.execute {
             val srcTime = file.lastModified()
-            val cards = java.io.File(ctx0.cacheDir, "bg_blur_cards_v2.jpg")
+            val cards = java.io.File(ctx0.cacheDir, CARD_BLUR_CACHE)
             if (cards.exists() && cards.lastModified() >= srcTime) {
-                android.graphics.BitmapFactory.decodeFile(cards.absolutePath)?.let {
-                    val ib = it.asImageBitmap()
-                    android.os.Handler(android.os.Looper.getMainLooper()).post { blurredImage = ib }
-                }
+                decodeInto(cards) { blurredImage = it }
             } else {
-                regenerateBlurred()
+                // 上一版引擎的底图先顶上：观感与新版只差「盒式近似 vs 真高斯」，肉眼几乎不可分，
+                // 但省掉了一整个重算链路 —— 这是升级后首启不再卡的关键一步。
+                val legacy = LEGACY_CARD_BLUR_CACHES
+                    .map { java.io.File(ctx0.cacheDir, it) }
+                    .firstOrNull { it.exists() && it.lastModified() >= srcTime }
+                if (legacy != null) decodeInto(legacy) { blurredImage = it }
+                uiHandler.postDelayed({ regenerateBlurred() }, STARTUP_DEFER_MS)
             }
             if (bgBlur > 0.01f) {
-                val bgf = java.io.File(ctx0.cacheDir, "bg_blur_bg.jpg")
+                val bgf = java.io.File(ctx0.cacheDir, BG_BLUR_CACHE)
                 if (bgf.exists() && bgf.lastModified() >= srcTime) {
-                    android.graphics.BitmapFactory.decodeFile(bgf.absolutePath)?.let {
-                        val ib = it.asImageBitmap()
-                        android.os.Handler(android.os.Looper.getMainLooper()).post { blurredBgImage = ib }
-                    }
+                    decodeInto(bgf) { blurredBgImage = it }
                 } else {
-                    regenerateBgBlurred(bgBlur)
+                    val strength = bgBlur
+                    uiHandler.postDelayed({ regenerateBgBlurred(strength) }, STARTUP_DEFER_MS)
                 }
             }
+        }
+    }
+
+    /** 解码缓存底图 → 主线程写状态（启动路径上唯一的 IO，几十毫秒） */
+    private fun decodeInto(
+        f: java.io.File,
+        assign: (androidx.compose.ui.graphics.ImageBitmap) -> Unit,
+    ) {
+        android.graphics.BitmapFactory.decodeFile(f.absolutePath)?.let {
+            val ib = it.asImageBitmap()
+            uiHandler.post { assign(ib) }
         }
     }
 
@@ -222,53 +283,111 @@ object BackgroundStore {
                 val opts = android.graphics.BitmapFactory.Options().apply { inSampleSize = 8 }
                 val bmp = android.graphics.BitmapFactory.decodeFile(f.absolutePath, opts)
                     ?: return@execute
-                val c = dominantColorOf(bmp, Color(0xFFEC4141))   // fallback 只在空图时触发
+                // fallback 只在空图时触发；2026-10-03 起与柔化后的默认种子色（AppearancePrefs.DEF_ACCENT）一致
+                val c = dominantColorOf(bmp, Color(0xFFDA5353))
                 bmp.recycle()
                 uiHandler.post { seedColor = c }
             }
         }
     }
 
-    /** 后台生成卡片取样底图：固定半径 26 三轮盒式模糊（= 最大强度，对齐 iOS 控制中心玻璃观感） */
-    fun regenerateBlurred() = generateInto(radius = 26, passes = 3, cacheName = "bg_blur_cards_v2.jpg") { ib ->
-        blurredImage = ib
-    }
+    /**
+     * 卡片取样底图（★ 2026-10-16 改用 Blurry 真高斯，见 [GlassBlur] 的文件头）：
+     * 半径取 `ScriptIntrinsicBlur` 上限 25（旧版是半径 26 的三轮盒式近似 —— 强度等价，
+     * 但盒式会把相邻色块和成一片平色，观感是「蒙了层灰」；真高斯的长尾让色块边界平滑
+     * 过渡但仍看得出，才是「玻璃后面透出彩色」）。
+     *
+     * 仍然是「整屏一张底、卡片按自身屏幕位置取样」的老架构 —— 只是把**模糊算法**换成库。
+     * 不逐卡片现场糊的理由：本工程的玻璃件（设置行 / 列表行 / 播放控件…）同屏可能十几个，
+     * 每个都跑一次 RenderScript 就是十几毫秒 × N；而底图只在换图/换主题时变，
+     * 一次算好全站共用，观感完全一致、代价低一个数量级。
+     */
+    fun regenerateBlurred() = generateInto(
+        radius = GlassBlur.MAX_RADIUS,
+        engine = BlurEngine.BLURRY,
+        cacheName = CARD_BLUR_CACHE,
+    ) { ib -> blurredImage = ib }
 
     /** 背景模糊底图：二次曲线 2..14 —— 滑杆前半段几乎无感，轻滑不再剧变 */
     fun regenerateBgBlurred(strength: Float) {
         val radius = (2 + strength * strength * 12).toInt().coerceIn(2, 14)
-        generateInto(radius = radius, cacheName = "bg_blur_bg.jpg") { ib -> blurredBgImage = ib }
+        generateInto(radius = radius, cacheName = BG_BLUR_CACHE) { ib -> blurredBgImage = ib }
     }
+
+    /** 底图的模糊算法：卡片玻璃走 Blurry 真高斯，背景层滑杆维持原盒式近似（未在本次改动范围） */
+    private enum class BlurEngine { BOX, BLURRY }
 
     private fun generateInto(
         radius: Int,
         cacheName: String,
         passes: Int = 2,
+        engine: BlurEngine = BlurEngine.BOX,
         assign: (androidx.compose.ui.graphics.ImageBitmap) -> Unit,
     ) {
-        val f = file
         genExecutor.execute {
             runCatching {
-                val src = android.graphics.BitmapFactory.decodeFile(f.absolutePath) ?: return@execute
+                val src = decodeWallpaper() ?: return@execute
                 val side = minOf(src.width, src.height)
                 val square = android.graphics.Bitmap.createBitmap(
                     src, (src.width - side) / 2, (src.height - side) / 2, side, side)
                 val scaled = android.graphics.Bitmap.createScaledBitmap(square, 466, 466, true)
                 if (scaled != square) square.recycle()
-                val w = scaled.width; val h = scaled.height
-                val px = IntArray(w * h)
-                scaled.getPixels(px, 0, w, 0, 0, w, h)
-                boxBlur(px, w, h, radius = radius, passes = passes)
-                val out = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
-                out.setPixels(px, 0, w, 0, 0, w, h)
+                // ★ 2026-10-16：卡片底图走 Blurry（ScriptIntrinsicBlur 真高斯）；
+                //   库返回 null（RenderScript 与 stack 兜底都失败）时回落盒式近似，不空转。
+                val out = when (engine) {
+                    BlurEngine.BLURRY ->
+                        GlassBlur.blur(ctx0, scaled, radius) ?: boxBlurred(scaled, radius, passes)
+                    BlurEngine.BOX -> boxBlurred(scaled, radius, passes)
+                } ?: return@execute
                 java.io.FileOutputStream(java.io.File(ctx0.cacheDir, cacheName)).use {
                     out.compress(android.graphics.Bitmap.CompressFormat.JPEG, 88, it)
                 }
                 val ib = out.asImageBitmap()
-                android.os.Handler(android.os.Looper.getMainLooper()).post { assign(ib) }
+                uiHandler.post { assign(ib) }
                 src.recycle()
             }
         }
+    }
+
+    /**
+     * 解码壁纸，**按需降采样**（★ 2026-10-16 新增）。
+     *
+     * 旧实现是 `BitmapFactory.decodeFile(path)` 全分辨率解码：一张 4000px 的手机壁纸在手表上
+     * 就是 ~64MB 的 ARGB_8888 分配 + 一次全图解码，而我们最终只要一张 466 方图 ——
+     * 这笔开销在冷启动窗口里（缓存未命中时）尤其致命，用户口径「现在冷启动好卡」。
+     * 现在先 `inJustDecodeBounds` 读尺寸、再选 2 的幂 `inSampleSize` 解到
+     * 长边 ≥ [WALLPAPER_DECODE_TARGET]（留 2x 余量给裁方 + 缩放），解码量降到 ~1/16。
+     */
+    private fun decodeWallpaper(): android.graphics.Bitmap? {
+        val path = file.absolutePath
+        val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        android.graphics.BitmapFactory.decodeFile(path, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        var sample = 1
+        while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= WALLPAPER_DECODE_TARGET) {
+            sample *= 2
+        }
+        val opts = android.graphics.BitmapFactory.Options().apply {
+            inSampleSize = sample
+            inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888
+        }
+        return android.graphics.BitmapFactory.decodeFile(path, opts)
+    }
+
+    /** 盒式近似（三轮默认）：原卡片/背景底图的算法，作为 Blurry 不可用时的兜底保留 */
+    private fun boxBlurred(
+        src: android.graphics.Bitmap,
+        radius: Int,
+        passes: Int,
+    ): android.graphics.Bitmap? {
+        val w = src.width; val h = src.height
+        if (w <= 0 || h <= 0) return null
+        val px = IntArray(w * h)
+        src.getPixels(px, 0, w, 0, 0, w, h)
+        boxBlur(px, w, h, radius = radius, passes = passes)
+        val out = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
+        out.setPixels(px, 0, w, 0, 0, w, h)
+        return out
     }
 
     /** 分离式盒式模糊（滑窗累加，纯 Kotlin，API 无关） */

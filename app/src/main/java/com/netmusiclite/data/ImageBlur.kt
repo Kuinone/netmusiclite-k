@@ -1,6 +1,8 @@
 package com.netmusiclite.data
 
 import android.graphics.Bitmap
+import kotlin.math.ceil
+import kotlin.math.exp
 
 /**
  * 位图高斯模糊工具（纯 Kotlin 分离式盒式模糊，滑窗累加，API 无关）。
@@ -18,6 +20,85 @@ object ImageBlur {
         val w = (src.width * scale).toInt().coerceAtLeast(1)
         val h = (src.height * scale).toInt().coerceAtLeast(1)
         return Bitmap.createScaledBitmap(src, w, h, true)
+    }
+
+    /**
+     * 真·高斯模糊（2026-10-06 用户口径「封面模糊用高斯模糊，不够通透」）：
+     * 分离式两趟（横 → 竖），权重严格取 `exp(-x²/2σ²)` 再归一化，核半径 2.5σ。
+     * 与下面三轮盒式近似的差别就在「通透」上：盒式模糊的低频保留差、还会把画面压成
+     * 一片平色（相邻色块被彻底和成灰），真高斯的长尾让色块边界平滑过渡但仍看得出来，
+     * 观感是「玻璃后面透出彩色」，而不是「蒙了一层灰」。
+     * 只在**小图**上跑（调用方先缩到 96~128 边长），所以直接卷积的开销完全可接受。
+     */
+    fun gaussian(src: Bitmap, sigma: Float): Bitmap {
+        val w = src.width
+        val h = src.height
+        if (w <= 1 || h <= 1 || sigma < 0.5f) return src
+        val radius = ceil(sigma * 2.5f).toInt().coerceAtLeast(1)
+        val kernel = FloatArray(radius * 2 + 1)
+        val denom = 2.0 * sigma * sigma
+        var sum = 0.0
+        for (i in -radius..radius) {
+            val v = exp(-(i * i) / denom)
+            kernel[i + radius] = v.toFloat()
+            sum += v
+        }
+        for (i in kernel.indices) kernel[i] = (kernel[i] / sum).toFloat()
+
+        val n = w * h
+        val px = IntArray(n)
+        src.getPixels(px, 0, w, 0, 0, w, h)
+        val rp = FloatArray(n)
+        val gp = FloatArray(n)
+        val bp = FloatArray(n)
+        for (i in 0 until n) {
+            val p = px[i]
+            rp[i] = ((p shr 16) and 0xFF).toFloat()
+            gp[i] = ((p shr 8) and 0xFF).toFloat()
+            bp[i] = (p and 0xFF).toFloat()
+        }
+        // 横趟结果 → rp/gp/bp（覆盖原值），竖趟结果 → tr/tg/tb，最后合回 rp/gp/bp
+        val tr = FloatArray(n)
+        val tg = FloatArray(n)
+        val tb = FloatArray(n)
+        convolve(rp, tr, w, h, kernel, radius, true)
+        convolve(gp, tg, w, h, kernel, radius, true)
+        convolve(bp, tb, w, h, kernel, radius, true)
+        convolve(tr, rp, w, h, kernel, radius, false)
+        convolve(tg, gp, w, h, kernel, radius, false)
+        convolve(tb, bp, w, h, kernel, radius, false)
+        val out = IntArray(n)
+        for (i in 0 until n) {
+            out[i] = (0xFF shl 24) or
+                (rp[i].toInt().coerceIn(0, 255) shl 16) or
+                (gp[i].toInt().coerceIn(0, 255) shl 8) or
+                bp[i].toInt().coerceIn(0, 255)
+        }
+        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        bmp.setPixels(out, 0, w, 0, 0, w, h)
+        return bmp
+    }
+
+    /** 单通道单方向卷积（边缘夹取；核已归一化 ⇒ 夹取不会整体压暗） */
+    private fun convolve(
+        src: FloatArray, dst: FloatArray, w: Int, h: Int,
+        kernel: FloatArray, r: Int, horizontal: Boolean,
+    ) {
+        val len = if (horizontal) w else h
+        val other = if (horizontal) h else w
+        val step = if (horizontal) 1 else w
+        for (o in 0 until other) {
+            val base = if (horizontal) o * w else o
+            for (x in 0 until len) {
+                var acc = 0f
+                for (k in -r..r) {
+                    var s = x + k
+                    if (s < 0) s = 0 else if (s >= len) s = len - 1
+                    acc += src[base + s * step] * kernel[k + r]
+                }
+                dst[base + x * step] = acc
+            }
+        }
     }
 
     /** 三轮盒式模糊（近似高斯）；[passes] 每轮双向滑窗，radius 越大越糊 */

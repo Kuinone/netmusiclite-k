@@ -62,35 +62,67 @@ private val homeItems = listOf(
     HomeItem("设置", NcmIcons.Settings, Routes.SETTINGS),
 )
 
+/**
+ * ★ 2026-10-06 访客模式主页列表（用户口径「点击后直接进入主页，此时主页只显示
+ * 听本地音乐（在最上方）听歌排行，最近播放，设置四个卡片」）：
+ * 顺序按用户原话 —— 听本地音乐排最上，设置收尾。
+ */
+private val guestHomeItems = listOf(
+    HomeItem("听本地音乐", NcmIcons.LocalMusic, Routes.LOCAL_MUSIC),
+    HomeItem("听歌排行", NcmIcons.Chart, Routes.RECORD),
+    HomeItem("最近播放", NcmIcons.History, Routes.PLAY_HISTORY),
+    HomeItem("设置", NcmIcons.Settings, Routes.SETTINGS),
+)
+
 @Composable
 fun HomeScreen(navController: NavHostController) {
+    if (com.netmusiclite.data.AppearancePrefs.isM3e) {
+        com.netmusiclite.ui.m3e.M3eHome(navController)
+        return
+    }
     // 流畅度 R4：播放状态改在「正在播放」卡片内部读取（见 nowPlayingSubtitle），
     // 切歌/暂停只重组那一张卡，不再整页 10 卡重组
     // 左划进播放页：统一走 SwipeBackBox 的 onSwipeLeft（子级挂横滑检测会饿死右滑返回）
+    val context = androidx.compose.ui.platform.LocalContext.current
+    // ★ 2026-10-06 访客模式：读 [SessionStore.epoch]（登录态版本号）建立重组依赖 ——
+    //   设置内添加账号成功 → epoch 自增 → 本页自动从精简四卡切回正常列表（含头像徽章）。
+    //   只读 SessionStore.loggedIn 的话（普通 SharedPreferences getter）不会订阅，切不回去。
+    val epoch = SessionStore.epoch
+    val loggedIn = epoch >= 0 && SessionStore.loggedIn
+    val items = if (loggedIn) homeItems else guestHomeItems
     SwipeBackBox(
-        onBack = null,
+        // ★ 2026-10-02（用户要求，仅主页）：右滑退出应用 = 退到后台（等同按手表侧键回表盘，
+        //   再次打开直接回到主页原样；音乐由前台服务继续）。收小+淡出的收场与「回到前台
+        //   自动复位」由 SwipeBackBox(exitAppOnBack) 负责，这里只执行动作。
+        onBack = { (context as? android.app.Activity)?.moveTaskToBack(true) },
+        exitAppOnBack = true,
         onSwipeLeft = {
             // 滑动来源：保留传送带滑动转场（NavMotionKind.Slide）；点击入口一律走缩放
+            // ★ 访客模式没有「正在播放」卡片，左划仍可进播放页（本地音乐播放后的返回落点）
             navController.navigateWithMotion(Routes.PLAYER, NavMotionSpec(NavMotionKind.Slide))
         },
     ) {
-        StackedCardList(progressTotal = homeItems.size + 1, horizontalInsetPx = 10) {
+        // 默认主题背景由 AppRoot 的全局背景层负责（2026-10-17 回退 1.24-r2 转场架构）。
+        // 头像徽章只在登录态显示（访客模式不渲染该项，列表直接从卡片开始）
+        StackedCardList(progressTotal = items.size + if (loggedIn) 1 else 1, horizontalInsetPx = 10) {
             // 头像+昵称 = 列表首项：进度最顶（吸附居中=页面正中），随列表滚动，非悬浮层；
             // 往下所有卡片与原主页保持一致（2026-09-13：解决主页没有视觉中心的问题）
-            item(key = "profile", contentType = { "home_profile" }) {
-                HomeProfileBadge(onAccount = {
-                    navController.navigateWithMotion(Routes.ACCOUNT, NavMotionSpec(NavMotionKind.Pill))
-                })
+            if (loggedIn) {
+                item(key = "profile", contentType = { "home_profile" }) {
+                    HomeProfileBadge(onAccount = {
+                        navController.navigateWithMotion(Routes.ACCOUNT, NavMotionSpec(NavMotionKind.Pill))
+                    })
+                }
             }
             items(
-                homeItems,
+                items,
                 key = { it.route },
                 contentType = { "home" }, // 流畅度 R5：同构卡片标注类型，提高 Lazy 布局复用
             ) { item ->
                 StackedIconCard(
                     title = item.title,
                     icon = item.icon,
-                    subtitle = if (item.route == Routes.PLAYER) nowPlayingSubtitle() else null,
+                    subtitle = if (loggedIn && item.route == Routes.PLAYER) nowPlayingSubtitle() else null,
                     iconTint = if (item.route == Routes.LIKED_SONGS) Accent else TextPrimary,
                     navMotionKind = NavMotionKind.Pill,
                     onClick = {

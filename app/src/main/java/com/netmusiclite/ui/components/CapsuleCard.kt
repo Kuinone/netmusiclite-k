@@ -1,12 +1,9 @@
 package com.netmusiclite.ui.components
 
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -21,14 +18,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.onGloballyPositioned
@@ -47,17 +42,7 @@ import com.netmusiclite.ui.nav.TransitionCoordinator
  *  流畅度（W5）：graphicsLayer block 延迟读取动画值，按压动画期间只更新图层属性，零重组。 */
 @Composable
 fun Modifier.pressScale(scaleTo: Float = PressMotion.SCALE): Modifier {
-    val src = remember { MutableInteractionSource() }
-    val pressed by src.collectIsPressedAsState()
-    val s by animateFloatAsState(
-        targetValue = if (pressed) scaleTo else 1f,
-        animationSpec = PressMotion.spec(pressed),
-        label = "pressScale",
-    )
-    return this.graphicsLayer {
-        scaleX = s
-        scaleY = s
-    }
+    return pressStretch(scaleTo = scaleTo)
 }
 
 /** 可按压缩放的点击容器 */
@@ -71,19 +56,10 @@ fun Pressable(
 ) {
     val src = remember { MutableInteractionSource() }
     val coordinates = remember { mutableStateOf<LayoutCoordinates?>(null) }
-    val pressed by src.collectIsPressedAsState()
-    val s by animateFloatAsState(
-        targetValue = if (pressed) scaleTo else 1f,
-        animationSpec = PressMotion.spec(pressed),
-        label = "press",
-    )
     Box(
         modifier = modifier
             .onGloballyPositioned { coordinates.value = it }
-            .graphicsLayer {
-                scaleX = s
-                scaleY = s
-            }
+            .pressStretch(interactionSource = src, scaleTo = scaleTo)
             .clickable(interactionSource = src, indication = null) {
                 if (navMotionKind == null) onClick()
                 else TransitionCoordinator.withSource(navMotionKind, coordinates.value, onClick)
@@ -105,24 +81,20 @@ fun CapsuleCard(
     navMotionKind: NavMotionKind? = null,
     onClick: () -> Unit = {},
 ) {
+    if (com.netmusiclite.data.AppearancePrefs.isM3e) {
+        com.netmusiclite.ui.m3e.M3eIconCard(title, icon, subtitle, modifier, onClick)
+        return
+    }
+
     val shape = RoundedCornerShape(50)
     val src = remember { MutableInteractionSource() }
-    val pressed by src.collectIsPressedAsState()
     val coordinates = remember { mutableStateOf<LayoutCoordinates?>(null) }
-    val s by animateFloatAsState(
-        targetValue = if (pressed) PressMotion.SCALE else 1f,
-        animationSpec = PressMotion.spec(pressed),
-        label = "capsule",
-    )
     Row(
         modifier = modifier
             .onGloballyPositioned { coordinates.value = it }
             .fillMaxWidth()
             .height(66.dp)
-            .graphicsLayer {
-                scaleX = s
-                scaleY = s
-            }
+            .pressStretch(interactionSource = src)
             .clip(shape)
             .background(SurfaceGlass)
             .glassEdgeHighlight(shape)

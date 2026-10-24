@@ -16,6 +16,11 @@ import androidx.compose.ui.graphics.Color
  *
  * ⚠ 原实现里 `bmp` 为空时直接返回 ui 层的 `Bg`，抽到 data 层后不能再反向依赖 ui 包，
  *   改为由调用方传入 [fallback]。
+ *
+ * ★ 2026-10-03 用户口径「禁用自动取色出现的高饱和度颜色」：取色结果统一做 HSL 限饱和
+ *   （[MAX_EXTRACT_SATURATION]，色相/明度不变）—— 本函数是封面主色与背景图主色两条
+ *   链路的唯一出口，在这一处压制即两条链路同时生效；预设主题色 / 中性元素不经过这里，
+ *   不受影响。[fallback] 是上游主题色，不做限制。
  */
 internal fun dominantColorOf(bmp: Bitmap, fallback: Color): Color {
     val w = bmp.width
@@ -53,22 +58,74 @@ internal fun dominantColorOf(bmp: Bitmap, fallback: Color): Color {
     var best = -1
     for (i in 0 until 4096) if (count[i] > (if (best < 0) 0 else count[best])) best = i
     if (best >= 0 && used > 0 && count[best] * 8 >= used) {
-        return Color(
-            red = sumR[best] / count[best],
-            green = sumG[best] / count[best],
-            blue = sumB[best] / count[best],
+        return capSaturation(
+            Color(
+                red = sumR[best] / count[best],
+                green = sumG[best] / count[best],
+                blue = sumB[best] / count[best],
+            ),
         )
     }
     if (used > 0) {
-        return Color(
-            red = (allR / used).toInt(),
-            green = (allG / used).toInt(),
-            blue = (allB / used).toInt(),
+        return capSaturation(
+            Color(
+                red = (allR / used).toInt(),
+                green = (allG / used).toInt(),
+                blue = (allB / used).toInt(),
+            ),
         )
     }
-    return Color(
-        red = (allR / n).toInt(),
-        green = (allG / n).toInt(),
-        blue = (allB / n).toInt(),
+    return capSaturation(
+        Color(
+            red = (allR / n).toInt(),
+            green = (allG / n).toInt(),
+            blue = (allB / n).toInt(),
+        ),
     )
+}
+
+/**
+ * 自动取色饱和度上限（HSL S ≤ 0.50）。
+ * 依据 2026-10-03 颜色预览图（`wm-配色预览-自动取色限饱和.png`）用户选定的档位：
+ * 高饱和取色（如 #1411F0）压到 #4341C0 —— 仍保留可辨认的色相，同时压掉刺眼彩度。
+ */
+private const val MAX_EXTRACT_SATURATION = 0.50f
+
+/**
+ * HSL 限饱和：饱和度超过上限时压到上限（色相、明度不变）；未超上限原样返回。
+ * 公式与 `ui/theme/Theme.kt` 的 toHsl / hsl 同式 —— data 层不能反向依赖 ui 包，
+ * 故此处自带一份；若 Theme.kt 的取色插值公式有改动，两者需同步。
+ */
+private fun capSaturation(color: Color, max: Float = MAX_EXTRACT_SATURATION): Color {
+    val r = color.red
+    val g = color.green
+    val b = color.blue
+    val mx = maxOf(r, g, b)
+    val mn = minOf(r, g, b)
+    val l = (mx + mn) / 2f
+    if (mx == mn) return color
+    val d = mx - mn
+    val s = if (l > 0.5f) d / (2f - mx - mn) else d / (mx + mn)
+    if (s <= max) return color
+    val h = if (mx == r) {
+        ((g - b) / d + if (g < b) 6f else 0f) / 6f
+    } else if (mx == g) {
+        ((b - r) / d + 2f) / 6f
+    } else {
+        ((r - g) / d + 4f) / 6f
+    }
+    val q = if (l < 0.5f) l * (1f + max) else l + max - l * max
+    val p = 2f * l - q
+    fun ch(t0: Float): Float {
+        var t = t0
+        if (t < 0f) t += 1f
+        if (t > 1f) t -= 1f
+        return when {
+            t < 1f / 6f -> p + (q - p) * 6f * t
+            t < 1f / 2f -> q
+            t < 2f / 3f -> p + (q - p) * (2f / 3f - t) * 6f
+            else -> p
+        }
+    }
+    return Color(ch(h + 1f / 3f), ch(h), ch(h - 1f / 3f))
 }

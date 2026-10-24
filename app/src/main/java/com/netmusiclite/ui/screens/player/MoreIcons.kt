@@ -1,5 +1,8 @@
 package com.netmusiclite.ui.screens.player
 
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.*
+import com.netmusiclite.data.AppearancePrefs
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
@@ -10,7 +13,29 @@ import androidx.compose.ui.graphics.vector.path
 import androidx.compose.ui.unit.dp
 
 /** More 二级菜单专用线性图标，避免改动其他页面共用的 NcmIcons。 */
+/** Material Rounded icons in M3E; the existing player menu icons in Classic. */
 internal object MoreIcons {
+    val Loop: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.Repeat else ClassicMoreIcons.Loop
+    val Shuffle: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.Shuffle else ClassicMoreIcons.Shuffle
+    val Single: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.RepeatOne else ClassicMoreIcons.Single
+    val Heart: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.MonitorHeart else ClassicMoreIcons.Heart
+    val Download: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.Download else ClassicMoreIcons.Download
+    val Queue: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.QueueMusic else ClassicMoreIcons.Queue
+    val Sleep: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.Bedtime else ClassicMoreIcons.Sleep
+    val Collect: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.BookmarkAdd else ClassicMoreIcons.Collect
+    val Share: ImageVector
+        get() = if (AppearancePrefs.isM3e) Icons.Rounded.Share else ClassicMoreIcons.Share
+}
+
+private object ClassicMoreIcons {
     private fun icon(name: String, block: ImageVector.Builder.() -> Unit): ImageVector =
         ImageVector.Builder(
             name = name,

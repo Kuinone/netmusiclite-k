@@ -10,7 +10,7 @@ plugins {
 // ★ 发布签名（2026-10-01）：从源码根目录的 keystore.properties 读取。
 //   为什么必须换掉 debug 签名：debug keystore 是公开的通用文件 —— 任何人拿它签一个
 //   同包名的 APK，在已安装设备上都能被当成「同一签名的升级包」装上；应用商店也一律拒收。
-//   keystore.properties / netmusiclite-release.jks / 签名信息.txt 三件套一起备份，丢了就再也
+//   keystore.properties / wmusic-release.jks / 签名信息.txt 三件套一起备份，丢了就再也
 //   无法给已发布的应用出升级包。
 //   文件缺失时回退 debug 签名（保证别人 clone 下来还能跑），并打一条警告。
 val keystorePropsFile = rootProject.file("keystore.properties")
@@ -44,11 +44,17 @@ android {
         applicationId = "com.netmusiclite"
         minSdk = 26
         targetSdk = 35
-        versionCode = 4
-        versionName = "1.0.3"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        // 逐版本变更说明在内部源码树维护，此处只保留当前版本号
+        versionCode = 65
+        versionName = "1.34"
     }
 
     buildTypes {
+        debug {
+            // Device regression tests must not replace the user's signed app or its account data.
+            applicationIdSuffix = ".motiontest"
+        }
         release {
             // 手表流畅度关键：release 关闭 debuggable + R8 优化
             isMinifyEnabled = true
@@ -57,7 +63,7 @@ android {
             signingConfig = if (hasReleaseKey) {
                 signingConfigs.getByName("release")
             } else {
-                logger.warn("NetMusicLite: 未找到 keystore.properties，release 退回 debug 签名（不可用于发布）")
+                logger.warn("WMusic: 未找到 keystore.properties，release 退回 debug 签名（不可用于发布）")
                 signingConfigs.getByName("debug")
             }
         }
@@ -85,6 +91,14 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.material3:material3")
+    implementation("androidx.wear.compose:compose-material3:1.5.6")
+    implementation("androidx.wear.compose:compose-foundation:1.5.6")
+    implementation("androidx.wear.compose:compose-navigation:1.5.6")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.compose.ui:ui-test-junit4:1.8.2")
+    debugImplementation("androidx.compose.ui:ui-test-manifest:1.8.2")
+    implementation("androidx.compose.material:material-icons-extended:1.7.8")
     implementation("androidx.activity:activity-compose:1.9.2")
     implementation("androidx.navigation:navigation-compose:2.8.2")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
@@ -94,4 +108,15 @@ dependencies {
     implementation("io.coil-kt:coil-compose:2.7.0")
     implementation("androidx.palette:palette-ktx:1.0.0")
     implementation("androidx.profileinstaller:profileinstaller:1.4.1")
+    // ★ 2026-10-17 v1.41：Horologist「扇贝形（scallop/pill-star）」播放键需要 RoundedPolygon；
+    //   graphics-shapes 1.0.1 已是 wear compose-material3 1.5.6 的传递依赖（本地 gradle 缓存里有），
+    //   这里显式声明保证编译期可见。
+    implementation("androidx.graphics:graphics-shapes:1.0.1")
+
+    // ★ 卡片毛玻璃的真高斯引擎（2026-10-16）：wasabeef/Blurry
+    //   https://github.com/wasabeef/Blurry —— 底层 ScriptIntrinsicBlur（真高斯），
+    //   失败自动回落库内 Java stack blur；**全程不碰 GPU RenderEffect**。
+    //   minSdk 21 < 本工程 minSdk 26（安卓 8），满足「库的 API 不超过安卓 8」的要求。
+    //   封装与理由见 data/GlassBlur.kt。
+    implementation("jp.wasabeef:blurry:4.0.0")
 }

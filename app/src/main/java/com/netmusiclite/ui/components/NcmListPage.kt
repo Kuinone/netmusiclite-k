@@ -10,7 +10,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.lazy.LazyColumn
+import com.netmusiclite.ui.m3e.AdaptiveLazyColumn as LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -39,7 +39,7 @@ import com.netmusiclite.ui.theme.TextPrimary
  * 统一圆屏列表骨架：
  * - 标题随滚动轻微放大缩小（弧形观感）
  * - 左上返回胶囊按钮（可选）
- * - 右缘弯曲进度条（传 progressTotal 启用）
+ * - 右缘弯曲进度条（progressTotal 未传时自动按列表实际条目数计算，不会退化成定值）
  * - 表冠滚动 + 震动
  */
 @Composable
@@ -52,19 +52,27 @@ fun NcmListPage(
     bottomPad: Int = 86,
     /** 卡片左右各收窄的像素（圆屏边缘出血微调；按用户口径直译 px，内部转 dp） */
     horizontalInsetPx: Int = 0,
+    /** m3e 下的列表形态（见 M3eListMode）；歌曲百科这类纯内容页要求「禁用堆叠」，传 SINK */
+    m3eMode: com.netmusiclite.ui.m3e.M3eListMode = com.netmusiclite.ui.m3e.M3eListMode.WEAR,
     content: LazyListScope.() -> Unit,
 ) {
+    if (com.netmusiclite.data.AppearancePrefs.isM3e) {
+        com.netmusiclite.ui.m3e.M3eList(title = title, mode = m3eMode, content = content)
+        return
+    }
     val listState = rememberLazyListState()
     val insetDp = with(LocalDensity.current) { horizontalInsetPx.toFloat().toDp() }
     // 2026-10-01：与 StackedCardList 同口径的额外横向收窄 —— 圆屏上下弧区会切掉通宽卡片的
     // 左右上角，列表越长越明显（歌曲百科卡片此前只收 inset，滚动到弧区即被裁）。
     // 收窄 2.3%/边后，卡片角始终落在圆内，任何长度都不会被屏幕裁切。
-    val screenWidthDp = androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp
+    // ⚠ 用 screenWidthUiDp（UI 坐标系屏宽）：密度被 NcmTheme 等比缩放后，
+    //   LocalConfiguration.screenWidthDp 不再等于屏宽，收窄量会算错（见 Common.kt 注释）
+    val screenWidthDp = screenWidthUiDp().value
     val widthShrink = (screenWidthDp * 0.023f).dp
 
     val titleScale by remember(listState) {
         derivedStateOf {
-            val off = listState.firstVisibleItemScrollOffset.coerceIn(0, 160)
+            val off = com.netmusiclite.ui.m3e.listFirstOffset(listState).coerceIn(0, 160)
             1f + (1f - off / 160f) * 0.14f
         }
     }
@@ -76,16 +84,19 @@ fun NcmListPage(
     }
     val progress by remember(listState, progressTotal) {
         derivedStateOf {
-            if (progressTotal <= 1) 0.15f
+            // 分母口径 = LazyColumn 实际条目数（含首尾 spacer/标题），与显式传值一致（缓存清理 = 4）；
+            // 未传 progressTotal 的页面若固定 0.15f，弧线不随滚动（歌曲百科/免责声明/关于应用曾中招）
+            val total = if (progressTotal > 1) progressTotal else com.netmusiclite.ui.m3e.listLayoutInfo(listState).totalItemsCount
+            if (total <= 1) 0.15f
             else {
-                val info = listState.layoutInfo
+                val info = com.netmusiclite.ui.m3e.listLayoutInfo(listState)
                 val visible = info.visibleItemsInfo
                 if (visible.isEmpty()) 0.15f
                 else {
                     val center = (info.viewportStartOffset + info.viewportEndOffset) / 2f
                     val idx = visible.firstOrNull { it.offset <= center && it.offset + it.size >= center }?.index
                         ?: visible.first().index
-                    val r = idx.toFloat() / (progressTotal - 1).coerceAtLeast(1)
+                    val r = idx.toFloat() / (total - 1).coerceAtLeast(1)
                     r.coerceIn(0f, 1f)
                 }
             }
@@ -132,7 +143,7 @@ fun NcmListPage(
 /** 歌词页等自绘列表也能用的进度估算 */
 fun estimateProgress(state: LazyListState, total: Int): Float {
     if (total <= 1) return 0.15f
-    val info = state.layoutInfo
+    val info = com.netmusiclite.ui.m3e.listLayoutInfo(state)
     val visible = info.visibleItemsInfo
     if (visible.isEmpty()) return 0.15f
     val center = (info.viewportStartOffset + info.viewportEndOffset) / 2f

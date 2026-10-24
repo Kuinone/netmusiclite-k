@@ -14,3 +14,13 @@ local.properties
 *.keystore
 keystore.properties
 签名信息.txt
+
+# 编辑器/手工备份残留，绝不进仓
+*.bak
+*.bak-*
+.bak*/
+
+# 逆向与发版笔记（本地维护，不公开）
+docs/
+work/
+ncm-re/

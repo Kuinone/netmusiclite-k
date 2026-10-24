@@ -52,10 +52,26 @@ data class PlaylistItem(
     val trackCount: Int,
     val playCount: Long,
     val isMine: Boolean,
+    /** 网易的官方标记：5 = 「我喜欢的音乐」特殊歌单（不能被当成普通歌单做增删曲目） */
+    val specialType: Int = 0,
+    /** 当前账号是否已收藏该歌单（来自歌单详情响应的 subscribed；自己的歌单恒 false） */
+    val subscribed: Boolean = false,
 )
 
 @Immutable
 data class FriendInfo(val id: Long, val name: String, val avatarUrl: String?)
+
+/**
+ * 私信里认出的一条「一起听邀请」，正文链接与官方 App 的邀请卡片（bodyType=23
+ * generalMsg 卡）共用这一形态。
+ *
+ * @param code 直接丢给 `ListenSession.join()` 的那一段（完整链接优先，其次裸房号）——
+ *   join 内部走 `ListenSession.parseInvite` 二次提取，这里不另写一套解析。
+ * @param roomId 认出来的房间号（只用于副标题展示）
+ * @param inviterId 邀请人 uid（链接/卡片里带才有，0 = 未知，join 会退回 check 响应的 creatorId）
+ */
+@Immutable
+data class ChatInvite(val code: String, val roomId: String, val inviterId: Long)
 
 /** 私信单条（来自 /api/msg/private/history） */
 @Immutable
@@ -66,6 +82,8 @@ data class ChatMessage(
     val fromMe: Boolean,
     /** 非空 = 歌曲卡片消息：聊天页渲染成可点封面卡，点击直接播放 */
     val song: Song? = null,
+    /** 非空 = 一起听邀请卡片：聊天页渲染成可点邀请卡，点击直接进房 */
+    val invite: ChatInvite? = null,
 )
 
 /** 私信会话（来自 /api/msg/private/users：msgs 会话数组 + users 资料数组合并而来） */
@@ -79,8 +97,23 @@ data class ChatSession(
     val unread: Int,
 )
 
+/**
+ * 逐字歌词的一个字（段）—— 来自 yrc（/api/song/lyric/v1 的 yv 路，网易「逐字」歌词）。
+ * 时间相对整首歌（毫秒），text 是该段文字（可能含空格，反序列化后不再拆分）。
+ */
 @Immutable
-data class LyricLine(val timeMs: Long, val text: String)
+data class LyricWord(val text: String, val startMs: Long, val durationMs: Long)
+
+@Immutable
+data class LyricLine(
+    val timeMs: Long,
+    val text: String,
+    /**
+     * 逐字数据（2026-10-06 用户口径③）：非空且 size>1 才值得走逐字点亮；
+     * 缺失（老接口/纯 lrc/本地文件）时为 null，调用方一律回落到整行扫光。
+     */
+    val words: List<LyricWord>? = null,
+)
 
 /** 用户资料（他人主页头部用） */
 data class UserDetail(val nickname: String, val avatarUrl: String?, val listenSongs: Long, val level: Int)

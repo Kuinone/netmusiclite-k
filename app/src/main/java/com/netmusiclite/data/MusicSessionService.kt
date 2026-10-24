@@ -98,13 +98,28 @@ class MusicSessionService : MediaSessionService() {
      */
     private class EnginePlayer(delegate: Player) : ForwardingPlayer(delegate) {
 
-        override fun play() = PlayerEngine.playAction()
+        /**
+         * ★ 2026-10-23「暂停后熄屏，亮屏有概率自动开始播放」排查落点：
+         *   本会话是**系统/ROM 唯一能下发播放指令的入口**（ColorOS Watch 表盘音乐卡片、
+         *   下拉媒体控制、「正在播放」页绑定的就是这条 Media3 会话）。亮屏瞬间系统会重新
+         *   bind 本服务，部分 ROM 会顺带补发一条 PLAY 恢复上次播放 —— 它落到这里，
+         *   与用户点播放键**完全无法区分**。因此：
+         *    ① 这里保留一行 PlayDiag 日志，真机上直接看是「哪条通道」拉起的播放；
+         *    ② 真正的拦截在 [PlayerEngine.shouldBlockSystemResume]（亮屏 800ms 内 /
+         *       进程冷启动 3s 内 / 熄屏时丢弃非 UI 来源的起播）——
+         *       本类**不做**任何「按 playWhenReady 自行恢复」的判断，全部交回业务层。
+         */
+        override fun play() {
+            android.util.Log.i("PlayDiag", "media3 session play request")
+            PlayerEngine.playAction("media3")
+        }
 
         override fun pause() = PlayerEngine.pauseAction()
 
         /** 系统可能直接写 playWhenReady（媒体键/局域网控制器），同样走业务路径 */
         override fun setPlayWhenReady(playWhenReady: Boolean) {
-            if (playWhenReady) play() else pause()
+            android.util.Log.i("PlayDiag", "media3 session setPlayWhenReady=$playWhenReady")
+            if (playWhenReady) PlayerEngine.playAction("media3") else PlayerEngine.pauseAction()
         }
 
         override fun seekTo(positionMs: Long) = PlayerEngine.seekTo(positionMs)
